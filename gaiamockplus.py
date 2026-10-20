@@ -646,6 +646,14 @@ def _settle_none(prob, sol):
     '''No extra parameters to adjust (astrometry): the detection statistic is the chi2.'''
     return sol, sol[4]
 
+def _rv_weights_changed(prob, jitter_a, jitter_b, tol=0.05):
+    '''whether two jitters give RV errors (rv_err and jitter in quadrature) that differ by more than ~tol (relative)'''
+    if prob.n_rv == 0:
+        return False
+    sig_a = np.sqrt(prob.rv_err**2 + np.asarray(jitter_a)[prob.rv_set]**2)
+    sig_b = np.sqrt(prob.rv_err**2 + np.asarray(jitter_b)[prob.rv_set]**2)
+    return np.max(np.abs(np.log(sig_a/sig_b))) > tol
+
 def _fit_planets(prob, n_planets, max_planets, delta_chi2_min, initial_planets, optimizer, n_joint, refine, n_beam, verbose,
                  n_base_params, n_params_per_planet, settle=_settle_none):
     '''
@@ -653,7 +661,8 @@ def _fit_planets(prob, n_planets, max_planets, delta_chi2_min, initial_planets, 
     optionally refining and keeping a beam of solutions, until n_planets are fit (known-N mode) or the detection
     statistic stops improving by more than delta_chi2_min (blind mode, up to max_planets); or polish initial_planets.
     settle(prob, sol) adjusts any parameters held fixed during the search (e.g. RV jitter) and returns the solution and
-    its detection statistic (the chi2, or -2 ln L if the jitter is fit). A model with N planets has
+    its detection statistic (the chi2, or -2 ln L if the jitter is fit); if settling changes the RV weights, the new
+    planet is searched for again with the settled jitter. A model with N planets has
     n_base_params + n_params_per_planet*N free parameters, which must leave at least one degree of freedom.
     Returns P, phi, e (arrays), objective, the statistic for 0, 1, ... planets, the rejected candidate, the number of
     planets searched, and whether this was a blind search.
@@ -686,14 +695,32 @@ def _fit_planets(prob, n_planets, max_planets, delta_chi2_min, initial_planets, 
             sol, stat = settle(prob, sol)
             history.append(stat)
     else:
+        def grow(beam):
+            children = [child for parent in beam for child in _search_one_planet(prob, *parent[:3], settings)]
+            if refine and len(beam[0][0]) >= 1: # refine every child: a poor-looking child can refine into the best solution
+                children = [_refine_planets(prob, child, settings) for child in _dedupe(children, len(children))]
+            return _dedupe(children, n_beam)
+
         beam = [sol]
         while len(sol[0]) < n_target:
-            children = [child for parent in beam for child in _search_one_planet(prob, *parent[:3], settings)]
-            if refine and len(sol[0]) >= 1: # refine every child: a poor-looking child can refine into the best solution
-                children = [_refine_planets(prob, child, settings) for child in _dedupe(children, len(children))]
-            children = _dedupe(children, n_beam)
             jitter_before = prob.jitter.copy()
+            children = grow(beam)
             best, stat = settle(prob, children[0])
+            # the search weighted the data with the parent's jitter, which also absorbed the new planet's RV signal; if
+            # settling changed the weights, search again with the settled jitter and keep the better solution
+            searched_with = jitter_before
+            for _ in range(3):
+                jitter_best = prob.jitter.copy()
+                if not _rv_weights_changed(prob, searched_with, jitter_best):
+                    break
+                searched_with = jitter_best
+                retry = grow(beam)
+                retry_best, retry_stat = settle(prob, retry[0])
+                if retry_stat < stat - 1e-6:
+                    children, best, stat = retry, retry_best, retry_stat
+                else:
+                    prob.set_jitter(jitter_best)
+                    break
             gain = history[-1] - stat
             if verbose:
                 print('%d planets: P = %s d, delta = %.1f' % (len(sol[0]) + 1, np.array2string(np.sort(best[0]), precision=1), gain))
@@ -755,6 +782,26 @@ def _derived_planet_quantities(theta, cov, i, m_star):
             Jg[:, j] = dg/(2*h)
     return g0, np.sqrt(np.abs(np.diag(Jg @ cov @ Jg.T)))
 
+def _astrometric_goodness_of_fit(chi2_data, n_used, n_par, binned):
+    '''
+    F2, uwe, and the factor by which gaiamock inflates the uncertainties, from the astrometric chi2 of n_used measurements
+    and n_par parameters. If binned, each measurement is the mean of 8 CCD measurements, and the chi2 is converted to
+    that of the unbinned data, as in gaiamock.
+    '''
+    nu = n_used - n_par
+    chi2_red = chi2_data/nu
+    if binned:
+        chi2_red_unbinned = gaiamock.predict_reduced_chi2_unbinned_data(chi2_red_binned=chi2_red, n_param=n_par, N_points=n_used, Nbin=8)
+        nu_unbinned = 8*n_used - n_par
+        cc = np.sqrt(chi2_red_unbinned/(1 - 2/(9*nu_unbinned))**3)
+        F2 = gaiamock.predict_F2_unbinned_data(chi2_red_binned=chi2_red, n_param=n_par, N_points=n_used, Nbin=8)
+        uwe = np.sqrt(chi2_red_unbinned)
+    else:
+        cc = np.sqrt(chi2_red/(1 - 2/(9*nu))**3)
+        F2 = np.sqrt(9*nu/2)*(chi2_red**(1/3) + 2/(9*nu) - 1)
+        uwe = np.sqrt(chi2_red)
+    return F2, uwe, cc
+
 def _astrometry_fit_summary(prob, P, phi, e, m_star, binned):
     '''Linear parameters, uncertainties (from the Jacobian, inflated by the goodness of fit as in gaiamock), and derived quantities.'''
     order = np.argsort(P)
@@ -798,18 +845,7 @@ def _astrometry_fit_summary(prob, P, phi, e, m_star, binned):
     chi2_data = np.sum(resid(theta)**2)
     n_used, n_par = int(keep.sum()), len(theta)
     nu = n_used - n_par
-    if binned:
-        chi2_red = chi2_data/nu
-        chi2_red_unbinned = gaiamock.predict_reduced_chi2_unbinned_data(chi2_red_binned=chi2_red, n_param=n_par, N_points=n_used, Nbin=8)
-        nu_unbinned = 8*n_used - n_par
-        cc = np.sqrt(chi2_red_unbinned/(1 - 2/(9*nu_unbinned))**3)
-        F2 = gaiamock.predict_F2_unbinned_data(chi2_red_binned=chi2_red, n_param=n_par, N_points=n_used, Nbin=8)
-        uwe = np.sqrt(chi2_red_unbinned)
-    else:
-        chi2_red = chi2_data/nu
-        cc = np.sqrt(chi2_red/(1 - 2/(9*nu))**3)
-        F2 = np.sqrt(9*nu/2)*(chi2_red**(1/3) + 2/(9*nu) - 1)
-        uwe = np.sqrt(chi2_red)
+    F2, uwe, cc = _astrometric_goodness_of_fit(chi2_data, n_used, n_par, binned)
     cov = cc**2*cov
     sig = np.sqrt(np.abs(np.diag(cov)))
 
@@ -1099,6 +1135,304 @@ def fit_rv_planets(t_rvs_yr, rv, rv_err, rv_dataset=None, n_planets=None, max_pl
         planet['delta_chi2'] = delta
     result['chi2_history'] = history
     result['objective'] = sol[3]
+    if blind:
+        result['rejected_candidate'] = rejected
+        result['max_planets_searched'] = n_target
+    return result
+
+# ================================================================ joint fitting of astrometry and RVs
+
+def _ecc_prior_offset(a, b):
+    '''-2 ln Beta(mode; a, b), so that -2 ln Beta(e; a, b) minus this is >= 0 and can enter a least-squares fit as a squared residual.'''
+    from scipy.stats import beta
+    if a < 1 or b < 1:
+        raise ValueError('the joint fit supports eccentricity priors Beta(a, b) with a, b >= 1 only.')
+    mode = 0.5 if a + b == 2 else (a - 1)/(a + b - 2)
+    return -2*beta.logpdf(mode, a, b)
+
+class _JointModel:
+    '''
+    Physical model of astrometry + RVs for N planets, with
+        theta = (ra_off, dec_off, parallax, pmra, pmdec, then for each planet: P, e, phi_p, Omega, inc, w, a0_mas),
+    and the conventions of astrometry_and_rv_planets_model(): Thiele-Innes elements of the star's reflex orbit, and RVs
+    K [cos(nu + w) + e cos(w)] with the same w and K = 2 pi (a0/parallax) [AU] sin(inc)/(P sqrt(1 - e^2)), which needs
+    no stellar mass. The systemic velocity of each RV dataset is solved analytically (weighted mean of its residuals).
+    The RV errors include the jitter of the problem (prob.rv_err_eff); keep selects the astrometric epochs used.
+    '''
+    AU = 1.4959787e+11 # as in gaiamock.get_a0_mas()
+
+    def __init__(self, prob, c_funcs, keep, ast_scale=1.0):
+        self.prob, self.c_funcs, self.keep, self.ast_scale = prob, c_funcs, keep, ast_scale
+        self.ecc_offset = _ecc_prior_offset(prob.ecc_a, prob.ecc_b) if prob.ecc_a > 0 else None
+
+    def signals(self, theta):
+        '''the astrometric model (mas), and the sum of the planets' RV signals (km/s, without systemic velocities)'''
+        t, psi, plx_f = self.prob.data[0], self.prob.data[1], self.prob.data[2]
+        ra_off, dec_off, plx, pmra, pmdec = theta[:5]
+        ast = (ra_off + pmra*t)*np.sin(psi) + (dec_off + pmdec*t)*np.cos(psi) + plx*plx_f
+        rv = np.zeros(self.prob.n_rv)
+        for i in range((len(theta) - 5)//7):
+            P, e, phi, Omega, inc, w, a0 = theta[5 + 7*i: 12 + 7*i]
+            Tp = phi*P/(2*np.pi)
+            ast = ast + keplerian_al_signal(t, psi, P, Tp, e, *get_thiele_innes(a0, Omega, inc, w), self.c_funcs)
+            K = 2*np.pi*(a0/plx)*self.AU*np.sin(inc)/(P*86400*np.sqrt(1 - e**2))/1e3
+            rv = rv + keplerian_rv_signal(self.prob.t_rv, P, Tp, e, w, K, self.c_funcs)
+        return ast, rv
+
+    def gamma(self, rv_planets):
+        '''systemic velocity of each RV dataset that minimizes the chi2 (weighted mean of the residuals)'''
+        wts = 1/self.prob.rv_err_eff**2
+        y = self.prob.rv - rv_planets
+        return np.array([np.sum((wts*y)[self.prob.rv_set == k])/np.sum(wts[self.prob.rv_set == k]) for k in range(self.prob.n_sets)])
+
+    def residuals(self, theta, gamma=None):
+        '''normalized astrometric and RV residuals, plus prior terms as residuals (systemic velocities solved unless given)'''
+        ast, rv_pl = self.signals(theta)
+        if gamma is None:
+            gamma = self.gamma(rv_pl)
+        r = [((ast - self.prob.data[3])/self.prob.data[4])[self.keep]/self.ast_scale,
+             (rv_pl + gamma[self.prob.rv_set] - self.prob.rv)/self.prob.rv_err_eff]
+        if self.prob.plx_sig > 0:
+            r.append([(theta[2] - self.prob.plx_mu)/self.prob.plx_sig])
+        if self.ecc_offset is not None:
+            from scipy.stats import beta
+            e = theta[6::7]
+            r.append(np.sqrt(np.maximum(-2*beta.logpdf(e, self.prob.ecc_a, self.prob.ecc_b) - self.ecc_offset, 0)))
+        return np.concatenate(r)
+
+    def chi2_parts(self, theta):
+        '''astrometric chi2 (epochs used), RV chi2 (with jitter), parallax-prior term'''
+        ast, rv_pl = self.signals(theta)
+        gamma = self.gamma(rv_pl)
+        chi2_ast = np.sum((((ast - self.prob.data[3])/self.prob.data[4])[self.keep])**2)
+        chi2_rv = np.sum(((rv_pl + gamma[self.prob.rv_set] - self.prob.rv)/self.prob.rv_err_eff)**2)
+        prior = (theta[2] - self.prob.plx_mu)**2/self.prob.plx_sig**2 if self.prob.plx_sig > 0 else 0.0
+        return chi2_ast, chi2_rv, prior
+
+    def minus_2_ln_like(self, theta):
+        '''-2 ln L up to a constant (data + parallax prior; the same convention as _Problem.minus_2_ln_like)'''
+        return self.prob.minus_2_ln_like(sum(self.chi2_parts(theta)))
+
+    def fit_jitter(self, theta):
+        '''
+        Maximize the likelihood over the jitter of each RV dataset with the orbits fixed. With the planets' RV signals fixed,
+        each dataset depends only on its own jitter and systemic velocity, so each jitter is a bounded 1D minimization in
+        log(jitter) (with the systemic velocity re-solved), plus a check of zero jitter.
+        '''
+        from scipy.optimize import minimize_scalar
+        _, rv_pl = self.signals(theta)
+        y = self.prob.rv - rv_pl
+        jitter = self.prob.jitter.copy()
+        scale = np.ptp(self.prob.rv) + np.max(self.prob.rv_err)
+        for k in range(self.prob.n_sets):
+            yk, ek = y[self.prob.rv_set == k], self.prob.rv_err[self.prob.rv_set == k]
+            def stat(s):
+                v = ek**2 + s**2
+                g = np.sum(yk/v)/np.sum(1/v)
+                return np.sum((yk - g)**2/v + np.log(2*np.pi*v))
+            res = minimize_scalar(lambda u: stat(np.exp(u)), bounds=(np.log(1e-6*scale), np.log(10*scale)), method='bounded', options=dict(xatol=1e-7))
+            jitter[k] = min([(res.fun, np.exp(res.x)), (stat(0.0), 0.0)])[1]
+        self.prob.set_jitter(jitter)
+
+def _joint_start(prob, sol):
+    '''
+    Physical starting parameters from a linked solution (shared P, phi_p, e; separate astrometric Thiele-Innes and RV
+    amplitudes): Campbell elements from the Thiele-Innes elements, with the (Omega, w) -> (Omega + pi, w + pi) branch
+    chosen to match the w of the RV solution.
+    '''
+    P, phi, e = sol[:3]
+    _, mu_ast, worst, mu_rv = prob.chi2(P, phi, e)
+    theta = [mu_ast[0], mu_ast[2], mu_ast[4], mu_ast[1], mu_ast[3]]
+    S = prob.n_sets
+    for i in range(len(P)):
+        B, G, A, F = mu_ast[5 + 4*i: 9 + 4*i]
+        a0, Omega, w, inc = gaiamock.get_Campbell_elements(A, B, F, G)
+        w_rv = np.arctan2(mu_rv[S + 2*i + 1], mu_rv[S + 2*i])
+        if abs(np.angle(np.exp(1j*(w - w_rv)))) > np.pi/2:
+            Omega, w = Omega + np.pi, w + np.pi
+        theta += [P[i], e[i], phi[i], Omega, inc, w, a0]
+    return np.array(theta), worst
+
+def _refine_joint(prob, sol, c_funcs, fit_jitter, max_cycles=20):
+    '''
+    Exact joint fit of astrometry and RVs, starting from a linked solution: least squares over the physical parameters
+    (jitter fixed), alternating with the jitter fit, until -2 ln L converges. With outlier rejection, the rejected
+    astrometric epoch is the worst one of the linked solution, re-checked once against the joint solution.
+    Returns theta, the model (holding the epochs used), and -2 ln L.
+    '''
+    from scipy.optimize import least_squares
+    theta, worst = _joint_start(prob, sol)
+    n_pl = (len(theta) - 5)//7
+    lo = np.full(len(theta), -np.inf); hi = np.full(len(theta), np.inf)
+    lo[2] = 1e-6 # the RV amplitude needs a positive parallax
+    for i in range(n_pl):
+        k = 5 + 7*i
+        lo[k], hi[k] = prob.L[0], prob.U[0]               # P
+        lo[k + 1], hi[k + 1] = prob.L[2], prob.U[2]       # e
+        lo[k + 4], hi[k + 4] = 0., np.pi                  # inc
+        lo[k + 6] = 0.                                    # a0
+    theta = np.clip(theta, lo, hi)
+    for attempt in range(2):
+        keep = np.ones(prob.n, dtype=bool)
+        if worst >= 0:
+            keep[worst] = False
+        model = _JointModel(prob, c_funcs, keep)
+        previous = np.inf
+        for _ in range(max_cycles):
+            if n_pl > 0 or prob.n_rv > 0:
+                theta = least_squares(model.residuals, theta, bounds=(lo, hi), x_scale='jac', xtol=1e-12, ftol=1e-12, gtol=1e-12, max_nfev=5000).x
+            if fit_jitter and prob.n_rv > 0:
+                model.fit_jitter(theta)
+            stat = model.minus_2_ln_like(theta)
+            if previous - stat < 1e-6:
+                break
+            previous = stat
+        if not prob.reject:
+            break
+        ast, _ = model.signals(theta) # re-check the rejected epoch against the joint solution
+        new_worst = int(np.argmax(((ast - prob.data[3])/prob.data[4])**2))
+        if new_worst == worst:
+            break
+        worst = new_worst
+    return theta, model, stat
+
+def _joint_fit_summary(model, theta, m_star, binned):
+    '''Uncertainties (from the Jacobian of all residuals; astrometric uncertainties inflated as in gaiamock) and derived quantities.'''
+    prob = model.prob
+    n_pl = (len(theta) - 5)//7
+    S = prob.n_sets
+    # order the planets by period, and wrap the angles
+    order = np.argsort(theta[5::7])
+    theta = np.concatenate([theta[:5]] + [theta[5 + 7*i: 12 + 7*i] for i in order])
+    for i in range(n_pl):
+        k = 5 + 7*i
+        theta[k + 2] = np.mod(theta[k + 2], 2*np.pi); theta[k + 3] = np.mod(theta[k + 3], 2*np.pi); theta[k + 5] = np.mod(theta[k + 5], 2*np.pi)
+    _, rv_pl = model.signals(theta)
+    gamma = model.gamma(rv_pl)
+    chi2_ast, chi2_rv, prior = model.chi2_parts(theta)
+    n_used = int(model.keep.sum())
+    F2, uwe, cc = _astrometric_goodness_of_fit(chi2_ast, n_used, 5 + 7*n_pl, binned)
+
+    # Jacobian of all residuals with respect to (theta, gamma), with the astrometric errors scaled by cc as in gaiamock
+    full = np.concatenate([theta, gamma])
+    scaled = _JointModel(prob, model.c_funcs, model.keep, ast_scale=cc)
+    def resid(x):
+        return scaled.residuals(x[:len(theta)], gamma=x[len(theta):])
+    J = np.zeros((len(resid(full)), len(full)))
+    for j in range(len(full)):
+        h = 1e-7*max(abs(full[j]), 1e-2)
+        up, down = full.copy(), full.copy()
+        up[j] += h; down[j] -= h
+        J[:, j] = (resid(up) - resid(down))/(2*h)
+    try:
+        cov = np.linalg.inv(J.T @ J)
+    except np.linalg.LinAlgError:
+        cov = np.full((len(full), len(full)), np.nan)
+    sig = np.sqrt(np.abs(np.diag(cov)))
+    names = ['ra_off', 'dec_off', 'parallax', 'pmra', 'pmdec'] + ['%s_%d' % (k, i) for i in range(n_pl) for k in ('period', 'ecc', 'phi_p', 'Omega', 'inc', 'w', 'a0_mas')] \
+            + ['gamma_%d' % k for k in range(S)]
+
+    result = dict(n_planets=n_pl, minus_2_ln_like=model.minus_2_ln_like(theta), chi2=chi2_ast + chi2_rv + prior, chi2_ast=chi2_ast, chi2_rv=chi2_rv,
+                  n_obs=prob.n, n_used=n_used, n_rv=prob.n_rv, F2=F2, uwe=uwe, uncertainty_scale=cc,
+                  outlier_index=int(np.where(~model.keep)[0][0]) if (~model.keep).any() else -1,
+                  gamma=gamma, sig_gamma=sig[len(theta):], jitter=prob.jitter.copy(), theta=full, theta_names=names, cov=cov)
+    for j, name in enumerate(names[:5]):
+        result[name], result['sig_' + name] = full[j], sig[j]
+
+    def derived(x, i):
+        '''Tp, K (km/s), inc in degrees (and m_planet if m_star is given) of planet i'''
+        P, e, phi, Omega, inc, w, a0 = x[5 + 7*i: 12 + 7*i]
+        K = 2*np.pi*(a0/x[2])*_JointModel.AU*np.sin(inc)/(P*86400*np.sqrt(1 - e**2))/1e3
+        out = [phi*P/(2*np.pi), K, np.degrees(inc)]
+        if m_star is not None:
+            out.append(get_dark_companion_mass(a0_mas=a0, period=P, parallax=x[2], m1=m_star))
+        return np.array(out)
+
+    planets, model_planets = [], []
+    for i in range(n_pl):
+        g0 = derived(full, i)
+        Jg = np.zeros((len(g0), len(full)))
+        for j in range(len(full)):
+            h = 1e-4*sig[j] if (np.isfinite(sig[j]) and sig[j] > 0) else 1e-8
+            up, down = full.copy(), full.copy()
+            up[j] += h; down[j] -= h
+            Jg[:, j] = (derived(up, i) - derived(down, i))/(2*h)
+        sig_g = np.sqrt(np.abs(np.diag(Jg @ cov @ Jg.T)))
+        planet = {}
+        for j, key in enumerate(('period', 'ecc', 'phi_p', 'Omega', 'inc', 'w', 'a0_mas')):
+            planet[key], planet['sig_' + key] = full[5 + 7*i + j], sig[5 + 7*i + j]
+        for j, key in enumerate(('Tp', 'K', 'inc_deg') + (('m_planet',) if m_star is not None else ())):
+            planet[key], planet['sig_' + key] = g0[j], sig_g[j]
+        planets.append(planet)
+        if m_star is not None:
+            model_planets.append({k: planet[k] for k in PLANET_KEYS})
+    result['planets'] = planets
+    result['model_planets'] = model_planets if m_star is not None else None
+    return result
+
+def fit_astrometry_and_rv_planets(t_ast_yr, psi, plx_factor, ast_obs, ast_err, t_rvs_yr, rv, rv_err, rv_dataset=None, n_planets=None,
+                                  max_planets=3, delta_chi2_min=None, m_star=None, P_min=10., P_max=1e4, e_max=0.99, parallax_prior=None,
+                                  eccentricity_prior=None, reject_outlier=False, binned=True, fit_jitter=True, jitter=None, initial_planets=None,
+                                  optimizer='periodogram_multistart', n_joint=3, refine=True, n_beam=1, verbose=False, c_funcs=None, c_funcs_plus=None):
+    '''
+    Fit Gaia epoch astrometry and radial velocities jointly with a model of a star hosting several planets, in two steps:
+    1. A linked search, with the same search as fit_astrometry_planets() and fit_rv_planets() (gaiamock's
+       "periodogram_multistart" optimizer for each new planet, then a joint polish and a re-search of each planet with
+       the others held fixed). Each planet's period, phase and eccentricity are shared by the astrometry and the RVs,
+       whose amplitudes (Thiele-Innes elements; K cos(w), K sin(w)) are solved separately, so all the search machinery
+       applies unchanged.
+    2. An exact joint fit, starting from the linked solution: least squares over the physical parameters (ra_off, dec_off,
+       parallax, pmra, pmdec, and P, e, phi_p, Omega, inc, w, a0 for each planet), in which the RVs follow from the
+       astrometric orbit (the model of astrometry_and_rv_planets_model(), with w the star's argument of periastron and
+       K = 2 pi a0 sin(inc)/(P sqrt(1 - e^2)), a0 in AU), alternating with the jitter fit. The systemic velocities are
+       solved analytically. With RVs, Omega is determined in [0, 2 pi) (astrometry alone leaves Omega and Omega + pi).
+
+    Arguments are as in fit_astrometry_planets() (astrometry and search settings) and fit_rv_planets() (RVs and jitter):
+    t_ast_yr, psi, plx_factor, ast_obs, ast_err: epoch astrometry. t_rvs_yr, rv, rv_err, rv_dataset: RVs (km/s), with
+        times relative to the same reference epoch.
+    n_planets (known-N mode) or blind search (default) with max_planets and delta_chi2_min (applied to -2 ln L of the
+        linked model); initial_planets: starting guesses (dicts with 'period', 'Tp', 'ecc') instead of a search.
+    m_star: if given, planet masses and their uncertainties, and model_planets for astrometry_and_rv_planets_model().
+    parallax_prior, eccentricity_prior (Beta(a, b) with a, b >= 1), reject_outlier (astrometry), binned, P_min, P_max,
+        e_max, fit_jitter, jitter, optimizer, n_joint, refine, n_beam: as in fit_astrometry_planets()/fit_rv_planets().
+    c_funcs: gaiamock's compiled functions (read_in_C_functions(); read in automatically if None).
+
+    returns a dict with:
+        n_planets, planets (sorted by period; each with period, ecc, phi_p, Tp, Omega, inc, inc_deg, w, a0_mas, K,
+            [m_planet], their uncertainties sig_*, and delta_chi2 from the linked model, as in fit_astrometry_planets()),
+        ra_off, dec_off, parallax, pmra, pmdec (and sig_*), gamma, sig_gamma, jitter,
+        minus_2_ln_like, chi2, chi2_ast, chi2_rv, F2, uwe and uncertainty_scale (of the astrometry, as in gaiamock),
+        linked_minus_2_ln_like, consistency_delta (= minus_2_ln_like - linked_minus_2_ln_like >= 0; it is large if the
+        astrometric and RV orbits disagree), chi2_history (linked -2 ln L for 0, 1, 2, ... planets), theta, theta_names,
+        cov, model_planets, outlier_index, and in blind-search mode rejected_candidate and max_planets_searched.
+    Notes: astrometric uncertainties are inflated by gaiamock's goodness-of-fit factor (uncertainty_scale); the
+    uncertainty of the jitter is not propagated.
+    '''
+    prob = _Problem(ast=(t_ast_yr, psi, plx_factor, ast_obs, ast_err), rv=(t_rvs_yr, rv, rv_err, rv_dataset), parallax_prior=parallax_prior,
+                    eccentricity_prior=eccentricity_prior, reject_outlier=reject_outlier, P_min=P_min, P_max=P_max, e_max=e_max,
+                    c_funcs_plus=c_funcs_plus)
+    if eccentricity_prior is not None:
+        _ecc_prior_offset(*eccentricity_prior) # check that the prior is supported
+    if jitter is not None:
+        jitter = np.broadcast_to(np.asarray(jitter, dtype=float), (prob.n_sets,))
+        if np.any(jitter < 0) or not np.all(np.isfinite(jitter)):
+            raise ValueError('jitter must be non-negative.')
+        prob.set_jitter(jitter)
+    if c_funcs is None:
+        c_funcs = gaiamock.read_in_C_functions()
+    settle = _settle_rv if fit_jitter else _settle_rv_fixed_jitter
+    n_base = 5 + prob.n_sets*(2 if fit_jitter else 1)
+    sol, history, rejected, n_target, blind = _fit_planets(prob, n_planets, max_planets, delta_chi2_min, initial_planets, optimizer, n_joint,
+                                                           refine, n_beam, verbose, n_base, 9, settle)
+    deltas = _leave_one_out(prob, sol, history, settle)
+    linked = settle(prob, sol)[1]
+    theta, model, stat = _refine_joint(prob, sol, c_funcs, fit_jitter)
+    result = _joint_fit_summary(model, theta, m_star, binned)
+    for planet, delta in zip(result['planets'], deltas):
+        planet['delta_chi2'] = delta
+    result['linked_minus_2_ln_like'] = linked
+    result['consistency_delta'] = result['minus_2_ln_like'] - linked
+    result['chi2_history'] = history
     if blind:
         result['rejected_candidate'] = rejected
         result['max_planets_searched'] = n_target
