@@ -1880,21 +1880,67 @@ def get_Campbell_elements(A, B, F, G):
     if np.isscalar(A) and np.isscalar(B) and np.isscalar(F) and np.isscalar(G):
         return float(a0), float(Omega), float(w), float(inclination)
     return a0, Omega, w, inclination
-        
+
+def get_astrometric_mass_function(a0_mas, period, parallax):
+    '''
+    calculate the astrometric mass function, fm = (a0/AU)^3/(period/yr)^2, in Msun.
+    It uses the same physical constants as get_a0_mas(), so that the functions below exactly invert it.
+    a0_mas: photocenter semimajor axis in mas
+    period: orbital period in days
+    parallax: 1/distance, in mas
+    '''
+    G, Msun, AU = 6.6743e-11, 1.98840987069805e+30, 1.4959787e+11
+    a0_m = np.asarray(a0_mas, dtype=float)/parallax*AU
+    P_s = np.asarray(period, dtype=float)*86400
+    return 4*np.pi**2*a0_m**3/(G*Msun*P_s**2)
+
+def get_dark_companion_mass(a0_mas, period, parallax, m1):
+    '''
+    Calculate the mass of a dark companion (e.g. a planet, white dwarf, or black hole) from the
+    photocenter orbit of its luminous host. This is the inverse of get_a0_mas(period, m1, m2, parallax, f=0).
+    a0_mas: photocenter semimajor axis in mas, i.e. the angular semimajor axis of the host star's reflex
+        orbit (the "astrometric signature", often called alpha). a0_mas/parallax is the same quantity in AU.
+    period: orbital period in days
+    parallax: 1/distance, in mas
+    m1: mass of the luminous host star in Msun
+    All inputs can be scalars or numpy arrays (broadcast together). Returns m2 in Msun.
+
+    For a dark companion, Kepler's third law gives m2^3 = fm*(m1 + m2)^2, where fm is the astrometric
+    mass function from get_astrometric_mass_function(). This cubic always has exactly one real root,
+    which we take from Cardano's formula. The terms are arranged so that every quantity added is positive,
+    which avoids the catastrophic cancellation of the textbook form; the result is accurate to machine
+    precision from sub-Earth-mass planets to black holes.
+    '''
+    fm = get_astrometric_mass_function(a0_mas=a0_mas, period=period, parallax=parallax)
+    m1 = np.asarray(m1, dtype=float)
+
+    # depressed-cubic quantities for x^3 - fm*x^2 - 2*fm*m1*x - fm*m1^2 = 0, written without subtractions
+    minus_half_q = fm**3/27 + fm**2*m1/3 + fm*m1**2/2
+    sqrt_D = fm*m1*np.sqrt(m1*(4*fm + 27*m1)/108)
+    u = np.cbrt(minus_half_q + sqrt_D)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        v = np.where(u > 0, (2*fm*m1/3 + fm**2/9)/u, 0.0) # u*v = -p/3, so v needs no second cube root
+    m2 = u + v + fm/3
+
+    return float(m2) if np.ndim(m2) == 0 else m2
+
 def get_companion_mass_from_mass_function(M1, a0_mas, period, parallax, fluxratio, tol=1e-6, max_iter=1000):
     '''
     This function calculates M2 from M1 and the parameters of the astrometric orbit, assuming a flux ratio. 
     It solves the transcendental equation iteratively using Newton's method.
+    For a dark companion (fluxratio = 0), it uses the exact solution from get_dark_companion_mass().
     M1: assumed mass of component 1 in Msun
     a0_mas: photocenter semimajor axis in mas 
     period: orbital period in days
     parallax: 1/distance, in mas
     fluxratio: F2/F1, with 0 corresponding to a dark companion
-    tol: tolerance for convergence
+    tol: tolerance for convergence, relative to the mass function
     max_iter: maximum number of iterations. 
     '''
-    
-    fm = (a0_mas/parallax)**3/(period/365.25)**2
+    if fluxratio == 0:
+        return get_dark_companion_mass(a0_mas=a0_mas, period=period, parallax=parallax, m1=M1)
+
+    fm = get_astrometric_mass_function(a0_mas=a0_mas, period=period, parallax=parallax)
     A = fluxratio / (1 + fluxratio)
 
     def f(x):
@@ -1909,7 +1955,7 @@ def get_companion_mass_from_mass_function(M1, a0_mas, period, parallax, fluxrati
     x = M1 / 2  # Start with half the mass of the primary as an initial guess
     for _ in range(max_iter):
         f_x, df_x = f(x), df_dx(x)
-        if np.abs(f_x) < tol:
+        if np.abs(f_x) < tol*fm:
             return x
         if df_x == 0:
             raise ValueError("Derivative is zero. Newton's method fails.")
