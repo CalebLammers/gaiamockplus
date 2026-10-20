@@ -350,6 +350,8 @@ def predict_astrometry_planets(ra, dec, parallax, pmra, pmdec, m_star, planets, 
 MAX_PLANETS_FIT = 10 # must match GMP_MAX_PLANETS in kepler_solve_planets.c
 _C_FUNCS_PLUS = None
 
+MAX_RV_DATASETS = 20 # must match GMP_MAX_SETS in kepler_solve_planets.c
+
 def read_in_C_functions_plus():
     '''
     Read in the compiled functions from kepler_solve_planets.so (compile kepler_solve_planets.c first; see the top of that file).
@@ -362,14 +364,17 @@ def read_in_C_functions_plus():
     dbl = np.ctypeslib.ndpointer(dtype=np.float64, flags='C_CONTIGUOUS')
     intp = np.ctypeslib.ndpointer(dtype=np.int32, flags='C_CONTIGUOUS')
     c_int, c_dbl = ctypes.c_int, ctypes.c_double
-    data = [c_int, dbl, dbl, dbl, dbl, dbl]
-    lib.gmp_astrometry_chi2.argtypes = data + [c_int, dbl, dbl, dbl, c_dbl, c_dbl, c_int, dbl, dbl]
-    lib.gmp_astrometry_periodogram.argtypes = data + [c_int, dbl, dbl, dbl, c_int, dbl, c_dbl, c_dbl, c_int, dbl]
-    lib.gmp_astrometry_scan.argtypes = data + [c_int, dbl, dbl, dbl, c_int, dbl, c_int, dbl, c_int, c_dbl, c_dbl, c_int, dbl]
-    lib.gmp_astrometry_polish.argtypes = data + [c_int, dbl, dbl, dbl, intp, dbl, dbl, c_dbl, c_dbl, c_dbl, c_dbl, c_int, c_int, c_dbl, c_dbl, c_int, c_int, dbl]
-    lib.gmp_astrometry_multistart.argtypes = data + [c_int, dbl, dbl, dbl, dbl, dbl, c_dbl, c_dbl, c_dbl, c_dbl, c_int, c_int, c_int, c_int, c_int, c_int, c_int, dbl, intp]
-    lib.gmp_astrometry_residuals.argtypes = data + [c_int, dbl, dbl]
-    for name in ('gmp_astrometry_chi2', 'gmp_astrometry_periodogram', 'gmp_astrometry_scan', 'gmp_astrometry_polish', 'gmp_astrometry_multistart', 'gmp_astrometry_residuals'):
+    # every function takes an astrometric dataset (n_ast, t, psi, plx_factor, obs, err, plx_mu, plx_sig, reject) and an
+    # RV dataset (n_rv, t_rv, rv, rv_err, rv_set, n_sets); either can be empty (n = 0)
+    data = [c_int, dbl, dbl, dbl, dbl, dbl, c_dbl, c_dbl, c_int, c_int, dbl, dbl, dbl, intp, c_int]
+    lib.gmp_chi2.argtypes = data + [c_int, dbl, dbl, dbl, dbl, dbl, dbl]
+    lib.gmp_periodogram.argtypes = data + [c_int, dbl, dbl, dbl, c_int, dbl, dbl]
+    lib.gmp_scan.argtypes = data + [c_int, dbl, dbl, dbl, c_int, dbl, c_int, dbl, c_int, dbl]
+    lib.gmp_polish.argtypes = data + [c_int, dbl, dbl, dbl, intp, dbl, dbl, c_dbl, c_dbl, c_int, c_dbl, c_dbl, c_int, c_int, dbl]
+    lib.gmp_multistart.argtypes = data + [c_int, dbl, dbl, dbl, dbl, dbl, c_dbl, c_dbl, c_int, c_int, c_int, c_int, c_int, c_int, dbl, intp]
+    lib.gmp_astrometry_residuals.argtypes = [c_int, dbl, dbl, dbl, dbl, dbl, c_int, dbl, dbl]
+    lib.gmp_rv_residuals.argtypes = [c_int, dbl, dbl, dbl, intp, c_int, c_int, dbl, dbl]
+    for name in ('gmp_chi2', 'gmp_periodogram', 'gmp_scan', 'gmp_polish', 'gmp_multistart', 'gmp_astrometry_residuals', 'gmp_rv_residuals'):
         getattr(lib, name).restype = None
     return lib
 
@@ -391,6 +396,29 @@ def _astrometry_data(t_ast_yr, psi, plx_factor, ast_obs, ast_err):
     if not all(np.all(np.isfinite(a)) for a in arrays) or np.any(arrays[4] <= 0):
         raise ValueError('epoch astrometry must be finite, with ast_err > 0.')
     return arrays
+
+def _rv_data(t_rvs_yr, rv, rv_err, rv_dataset):
+    '''
+    Check RV arrays and return t, rv, rv_err (contiguous float64), the dataset index of each RV (int32) and the number
+    of datasets. rv_dataset: None (one dataset) or integer indices 0, 1, ..., n_sets - 1 (each must be used).
+    '''
+    arrays = [np.ascontiguousarray(a, dtype=np.float64) for a in (t_rvs_yr, rv, rv_err)]
+    n = len(arrays[0])
+    if any(a.ndim != 1 or len(a) != n for a in arrays) or n == 0:
+        raise ValueError('t_rvs_yr, rv and rv_err must be non-empty 1D arrays of the same length.')
+    if not all(np.all(np.isfinite(a)) for a in arrays) or np.any(arrays[2] <= 0):
+        raise ValueError('RVs must be finite, with rv_err > 0.')
+    if rv_dataset is None:
+        sets = np.zeros(n, dtype=np.int32)
+    else:
+        sets = np.asarray(rv_dataset)
+        if sets.shape != (n,) or not np.issubdtype(sets.dtype, np.integer):
+            raise ValueError('rv_dataset must be an integer array with one entry per RV.')
+        sets = np.ascontiguousarray(sets, dtype=np.int32)
+    n_sets = int(sets.max()) + 1
+    if sets.min() < 0 or n_sets > MAX_RV_DATASETS or len(np.unique(sets)) != n_sets:
+        raise ValueError('rv_dataset values must be 0, 1, ..., n_sets - 1 (each used at least once; at most %d datasets).' % MAX_RV_DATASETS)
+    return arrays[0], arrays[1], arrays[2], sets, n_sets
 
 def _prior_args(parallax_prior, eccentricity_prior):
     '''Convert the prior options to the C arguments (plx_mu, plx_sig, ecc_a, ecc_b); sig/a/b <= 0 means no prior.'''
@@ -418,6 +446,117 @@ def _nonlinear_arrays(periods, phi_ps, eccs):
         raise ValueError('periods must be positive and 0 <= ecc < 1.')
     return arrays
 
+# Settings of the per-planet search, which is gaiamock's "periodogram_multistart" optimizer (see the ASTFIT_* settings
+# in kepler_solve_astrometry.c): number of periods in the main and short-period periodogram grids, number of phases in
+# the eccentricity scan, number of distinct periods scanned, number of starts polished, and whether the Nelder-Mead
+# polish uses gaiamock's "full" (tighter) tolerances.
+OPTIMIZER_SETTINGS = {
+    'periodogram_multistart': dict(n_period=180, n_short_period=560, n_ecc_phase=36, max_periods_keep=20, max_starts=48, full_nm=0),
+    'periodogram_multistart_full': dict(n_period=260, n_short_period=800, n_ecc_phase=48, max_periods_keep=24, max_starts=64, full_nm=1),
+}
+
+_EMPTY_DBL = np.zeros(1)
+_EMPTY_INT = np.zeros(1, dtype=np.int32)
+
+class _Problem:
+    '''
+    A fitting problem: epoch astrometry and/or RVs, plus fitting options, with thin wrappers around the compiled
+    functions. For fixed (P, phi_p, e) of each planet, the linear parameters of each dataset are solved exactly, and the
+    objective is the sum of the chi2 of the datasets (plus prior terms). RV jitter (one value per RV dataset) is added
+    in quadrature to rv_err; it is held fixed in each compiled call and set with set_jitter().
+    '''
+    def __init__(self, ast=None, rv=None, parallax_prior=None, eccentricity_prior=None, reject_outlier=False, P_min=10., P_max=1e4, e_max=0.99, c_funcs_plus=None):
+        self.lib = _get_c_funcs_plus(c_funcs_plus)
+        if ast is None and rv is None:
+            raise ValueError('no data.')
+        self.data = _astrometry_data(*ast) if ast is not None else None
+        self.n = len(self.data[0]) if ast is not None else 0
+        if rv is not None:
+            self.t_rv, self.rv, self.rv_err, self.rv_set, self.n_sets = _rv_data(*rv)
+            self.n_rv = len(self.rv)
+        else:
+            self.t_rv = self.rv = self.rv_err = _EMPTY_DBL
+            self.rv_set, self.n_sets, self.n_rv = _EMPTY_INT, 0, 0
+        self.set_jitter(np.zeros(self.n_sets))
+        self.plx_mu, self.plx_sig, self.ecc_a, self.ecc_b = _prior_args(parallax_prior, eccentricity_prior)
+        self.reject = int(bool(reject_outlier))
+        if self.reject and ast is None:
+            raise ValueError('reject_outlier applies to astrometry only.')
+        if not (0 < P_min < P_max) or not (0 < e_max < 1):
+            raise ValueError('require 0 < P_min < P_max and 0 < e_max < 1.')
+        # bounds on (P, phi_p, ecc), as in gaiamock (which also uses e >= 1e-6 with an eccentricity prior)
+        self.L = np.array([float(P_min), 0., 1e-6 if eccentricity_prior is not None else 0.])
+        self.U = np.array([float(P_max), 2*np.pi, float(e_max)])
+
+    def set_jitter(self, jitter):
+        '''Set the RV jitter (km/s, one value per RV dataset), added in quadrature to rv_err.'''
+        self.jitter = np.array(jitter, dtype=np.float64)
+        if self.n_rv:
+            self.rv_err_eff = np.ascontiguousarray(np.sqrt(self.rv_err**2 + self.jitter[self.rv_set]**2))
+        else:
+            self.rv_err_eff = _EMPTY_DBL
+
+    def _args(self):
+        ast = self.data if self.data is not None else [_EMPTY_DBL]*5
+        return (self.n, *ast, self.plx_mu, self.plx_sig, self.reject, self.n_rv, self.t_rv, self.rv, self.rv_err_eff, self.rv_set, self.n_sets)
+
+    def chi2(self, P, phi, e):
+        '''
+        chi2 of all datasets + parallax-prior term, the astrometric linear parameters, the index of the rejected
+        astrometric epoch (-1 if none), and the RV linear parameters.
+        '''
+        P, phi, e = _nonlinear_arrays(P, phi, e)
+        out, mu_ast, mu_rv = np.zeros(4), np.zeros(5 + 4*len(P)), np.zeros(self.n_sets + 2*len(P))
+        self.lib.gmp_chi2(*self._args(), len(P), P, phi, e, out, mu_ast, mu_rv)
+        return out[0] + out[1] + out[2], mu_ast, int(out[3]), mu_rv
+
+    def minus_2_ln_like(self, chi2):
+        '''-2 ln(likelihood) up to a constant: chi2 + sum of ln(2 pi sigma^2) of the RVs, which depends on the jitter.'''
+        return chi2 + (np.sum(np.log(2*np.pi*self.rv_err_eff**2)) if self.n_rv else 0.0)
+
+    def multistart(self, P, phi, e, optimizer):
+        '''
+        gaiamock's multistart search for one more planet, with planets (P, phi, e) held fixed. Returns the polished
+        starts as a list of (P, phi, e, objective) for the new planet, best first.
+        '''
+        P, phi, e = _nonlinear_arrays(P, phi, e)
+        s = OPTIMIZER_SETTINGS[optimizer]
+        out, n_out = np.zeros(4*s['max_starts']), np.zeros(1, dtype=np.int32)
+        self.lib.gmp_multistart(*self._args(), len(P), P, phi, e, self.L, self.U, self.ecc_a, self.ecc_b, s['n_period'], s['n_short_period'],
+                                s['n_ecc_phase'], s['max_periods_keep'], s['max_starts'], s['full_nm'], out, n_out)
+        return [tuple(row) for row in out[:4*n_out[0]].reshape(-1, 4)]
+
+    def polish(self, P, phi, e, free, max_iter=400, ftol=1e-6, xtol=1e-7, max_restarts=9, smooth=True):
+        '''
+        Nelder-Mead polish of the free planets (by default with the tolerances of gaiamock's "full" optimizer, restarted
+        until the objective stops improving), in (log P, e cos(phi), e sin(phi)) if smooth (default; cannot get stuck
+        at e = 0 or at the phi = 0/2 pi boundary) or in gaiamock's (log P, phi, e). Returns P, phi, e (polished copies),
+        objective (chi2 + all priors), and chi2 (all datasets + parallax-prior term).
+        '''
+        P, phi, e = (np.array(a, dtype=np.float64) for a in _nonlinear_arrays(P, phi, e))
+        P, phi, e = np.clip(P, self.L[0], self.U[0]), np.clip(phi, self.L[1], self.U[1]), np.clip(e, self.L[2], self.U[2])
+        out = np.zeros(5)
+        self.lib.gmp_polish(*self._args(), len(P), P, phi, e, np.ascontiguousarray(free, dtype=np.int32), self.L, self.U,
+                            self.ecc_a, self.ecc_b, max_iter, ftol, xtol, max_restarts, int(bool(smooth)), out)
+        return P, phi, e, out[0], out[1] + out[2] + out[4]
+
+    def residuals(self, theta, n_pl):
+        '''normalized astrometric residuals for theta = (ra_off, dec_off, parallax, pmra, pmdec, then P, e, phi_p, A, B, F, G per planet)'''
+        out = np.zeros(self.n)
+        self.lib.gmp_astrometry_residuals(self.n, *self.data, n_pl, np.ascontiguousarray(theta, dtype=np.float64), out)
+        return out
+
+    def rv_residuals(self, theta, n_pl):
+        '''normalized RV residuals (with jitter) for theta = (gamma per dataset, then P, e, phi_p, K cos(w), K sin(w) per planet)'''
+        out = np.zeros(self.n_rv)
+        self.lib.gmp_rv_residuals(self.n_rv, self.t_rv, self.rv, self.rv_err_eff, self.rv_set, self.n_sets, n_pl, np.ascontiguousarray(theta, dtype=np.float64), out)
+        return out
+
+def _AstrometryProblem(t_ast_yr, psi, plx_factor, ast_obs, ast_err, parallax_prior, eccentricity_prior, reject_outlier, P_min, P_max, e_max, c_funcs_plus):
+    '''An astrometry-only _Problem.'''
+    return _Problem(ast=(t_ast_yr, psi, plx_factor, ast_obs, ast_err), parallax_prior=parallax_prior, eccentricity_prior=eccentricity_prior,
+                    reject_outlier=reject_outlier, P_min=P_min, P_max=P_max, e_max=e_max, c_funcs_plus=c_funcs_plus)
+
 def get_astrometric_chi2_planets(t_ast_yr, psi, plx_factor, ast_obs, ast_err, periods, phi_ps, eccs, parallax_prior=None, reject_outlier=False, c_funcs_plus=None):
     '''
     Solve the linear astrometric parameters for fixed nonlinear orbital parameters of any number of planets
@@ -431,75 +570,28 @@ def get_astrometric_chi2_planets(t_ast_yr, psi, plx_factor, ast_obs, ast_err, pe
         chi2: data chi2, plus the parallax-prior term (mu_plx - mean)^2/sigma^2 if a prior is used
         mu: linear parameters (ra_off, pmra, dec_off, pmdec, parallax, then B, G, A, F for each planet)
     '''
-    lib = _get_c_funcs_plus(c_funcs_plus)
-    data = _astrometry_data(t_ast_yr, psi, plx_factor, ast_obs, ast_err)
-    P, phi, e = _nonlinear_arrays(periods, phi_ps, eccs)
-    plx_mu, plx_sig, _, _ = _prior_args(parallax_prior, None)
-    out, mu = np.zeros(3), np.zeros(5 + 4*len(P))
-    lib.gmp_astrometry_chi2(len(data[0]), *data, len(P), P, phi, e, plx_mu, plx_sig, int(bool(reject_outlier)), out, mu)
-    return out[0] + out[1], mu
+    prob = _AstrometryProblem(t_ast_yr, psi, plx_factor, ast_obs, ast_err, parallax_prior, None, reject_outlier, 1., 2., 0.5, c_funcs_plus)
+    chi2, mu, _, _ = prob.chi2(periods, phi_ps, eccs)
+    return chi2, mu
 
-# Settings of the per-planet search, which is gaiamock's "periodogram_multistart" optimizer (see the ASTFIT_* settings
-# in kepler_solve_astrometry.c): number of periods in the main and short-period periodogram grids, number of phases in
-# the eccentricity scan, number of distinct periods scanned, number of starts polished, and whether the Nelder-Mead
-# polish uses gaiamock's "full" (tighter) tolerances.
-OPTIMIZER_SETTINGS = {
-    'periodogram_multistart': dict(n_period=180, n_short_period=560, n_ecc_phase=36, max_periods_keep=20, max_starts=48, full_nm=0),
-    'periodogram_multistart_full': dict(n_period=260, n_short_period=800, n_ecc_phase=48, max_periods_keep=24, max_starts=64, full_nm=1),
-}
-
-class _AstrometryProblem:
-    '''Epoch astrometry plus fitting options, with thin wrappers around the compiled functions.'''
-    def __init__(self, t_ast_yr, psi, plx_factor, ast_obs, ast_err, parallax_prior, eccentricity_prior, reject_outlier, P_min, P_max, e_max, c_funcs_plus):
-        self.lib = _get_c_funcs_plus(c_funcs_plus)
-        self.data = _astrometry_data(t_ast_yr, psi, plx_factor, ast_obs, ast_err)
-        self.n = len(self.data[0])
-        self.plx_mu, self.plx_sig, self.ecc_a, self.ecc_b = _prior_args(parallax_prior, eccentricity_prior)
-        self.reject = int(bool(reject_outlier))
-        if not (0 < P_min < P_max) or not (0 < e_max < 1):
-            raise ValueError('require 0 < P_min < P_max and 0 < e_max < 1.')
-        # bounds on (P, phi_p, ecc), as in gaiamock (which also uses e >= 1e-6 with an eccentricity prior)
-        self.L = np.array([float(P_min), 0., 1e-6 if eccentricity_prior is not None else 0.])
-        self.U = np.array([float(P_max), 2*np.pi, float(e_max)])
-
-    def chi2(self, P, phi, e):
-        '''data chi2 + parallax-prior term, linear parameters, and index of the rejected epoch (-1 if none)'''
-        P, phi, e = _nonlinear_arrays(P, phi, e)
-        out, mu = np.zeros(3), np.zeros(5 + 4*len(P))
-        self.lib.gmp_astrometry_chi2(self.n, *self.data, len(P), P, phi, e, self.plx_mu, self.plx_sig, self.reject, out, mu)
-        return out[0] + out[1], mu, int(out[2])
-
-    def multistart(self, P, phi, e, optimizer):
-        '''
-        gaiamock's multistart search for one more planet, with planets (P, phi, e) held fixed. Returns the polished
-        starts as a list of (P, phi, e, objective) for the new planet, best first.
-        '''
-        P, phi, e = _nonlinear_arrays(P, phi, e)
-        s = OPTIMIZER_SETTINGS[optimizer]
-        out, n_out = np.zeros(4*s['max_starts']), np.zeros(1, dtype=np.int32)
-        self.lib.gmp_astrometry_multistart(self.n, *self.data, len(P), P, phi, e, self.L, self.U, self.plx_mu, self.plx_sig, self.ecc_a, self.ecc_b,
-                                           self.reject, s['n_period'], s['n_short_period'], s['n_ecc_phase'], s['max_periods_keep'],
-                                           s['max_starts'], s['full_nm'], out, n_out)
-        return [tuple(row) for row in out[:4*n_out[0]].reshape(-1, 4)]
-
-    def polish(self, P, phi, e, free, max_iter=400, ftol=1e-6, xtol=1e-7, max_restarts=9, smooth=True):
-        '''
-        Nelder-Mead polish of the free planets (by default with the tolerances of gaiamock's "full" optimizer, restarted
-        until the objective stops improving), in (log P, e cos(phi), e sin(phi)) if smooth (default; cannot get stuck
-        at e = 0 or at the phi = 0/2 pi boundary) or in gaiamock's (log P, phi, e). Returns P, phi, e (polished copies),
-        objective (chi2 + all priors), and chi2 (data + parallax-prior term).
-        '''
-        P, phi, e = (np.array(a, dtype=np.float64) for a in _nonlinear_arrays(P, phi, e))
-        P, phi, e = np.clip(P, self.L[0], self.U[0]), np.clip(phi, self.L[1], self.U[1]), np.clip(e, self.L[2], self.U[2])
-        out = np.zeros(4)
-        self.lib.gmp_astrometry_polish(self.n, *self.data, len(P), P, phi, e, np.ascontiguousarray(free, dtype=np.int32), self.L, self.U,
-                                       self.plx_mu, self.plx_sig, self.ecc_a, self.ecc_b, self.reject, max_iter, ftol, xtol, max_restarts, int(bool(smooth)), out)
-        return P, phi, e, out[0], out[1] + out[2]
-
-    def residuals(self, theta, n_pl):
-        out = np.zeros(self.n)
-        self.lib.gmp_astrometry_residuals(self.n, *self.data, n_pl, np.ascontiguousarray(theta, dtype=np.float64), out)
-        return out
+def get_rv_chi2_planets(t_rvs_yr, rv, rv_err, periods, phi_ps, eccs, rv_dataset=None, jitter=None, c_funcs_plus=None):
+    '''
+    Solve the linear RV parameters for fixed nonlinear orbital parameters of any number of planets (the RV counterpart
+    of get_astrometric_chi2_planets()).
+    t_rvs_yr: RV times in years relative to the reference epoch; rv, rv_err: RVs and uncertainties in km/s
+    periods (days), phi_ps (= 2 pi Tp/period, radians), eccs: arrays with one value per planet (can be empty)
+    rv_dataset: None (one dataset) or the dataset (instrument) index 0, 1, ... of each RV
+    jitter: None (no jitter) or one jitter per dataset in km/s, added in quadrature to rv_err
+    c_funcs_plus: from read_in_C_functions_plus() (read in automatically if None)
+    returns:
+        chi2: chi2 of the RVs (with the jitter)
+        mu: linear parameters (one systemic velocity per dataset, then K cos(w), K sin(w) for each planet)
+    '''
+    prob = _Problem(rv=(t_rvs_yr, rv, rv_err, rv_dataset), P_min=1., P_max=2., e_max=0.5, c_funcs_plus=c_funcs_plus)
+    if jitter is not None:
+        prob.set_jitter(np.broadcast_to(np.asarray(jitter, dtype=float), (prob.n_sets,)))
+    chi2, _, _, mu = prob.chi2(periods, phi_ps, eccs)
+    return chi2, mu
 
 def _same_periods(P1, P2, tol=0.005):
     '''True if two solutions have the same (sorted) periods to within a fractional tolerance.'''
@@ -550,6 +642,88 @@ def _refine_planets(prob, sol, settings):
             best = res
     return best
 
+def _settle_none(prob, sol):
+    '''No extra parameters to adjust (astrometry): the detection statistic is the chi2.'''
+    return sol, sol[4]
+
+def _fit_planets(prob, n_planets, max_planets, delta_chi2_min, initial_planets, optimizer, n_joint, refine, n_beam, verbose,
+                 n_base_params, n_params_per_planet, settle=_settle_none):
+    '''
+    The search shared by all fitting functions: add one planet at a time with gaiamock's search (_search_one_planet),
+    optionally refining and keeping a beam of solutions, until n_planets are fit (known-N mode) or the detection
+    statistic stops improving by more than delta_chi2_min (blind mode, up to max_planets); or polish initial_planets.
+    settle(prob, sol) adjusts any parameters held fixed during the search (e.g. RV jitter) and returns the solution and
+    its detection statistic (the chi2, or -2 ln L if the jitter is fit). A model with N planets has
+    n_base_params + n_params_per_planet*N free parameters, which must leave at least one degree of freedom.
+    Returns P, phi, e (arrays), objective, the statistic for 0, 1, ... planets, the rejected candidate, the number of
+    planets searched, and whether this was a blind search.
+    '''
+    if delta_chi2_min is None:
+        delta_chi2_min = DEFAULT_DELTA_CHI2_MIN
+    if optimizer not in OPTIMIZER_SETTINGS:
+        raise ValueError('optimizer must be one of %s.' % list(OPTIMIZER_SETTINGS))
+    settings = dict(optimizer=optimizer, n_joint=int(n_joint))
+    blind = n_planets is None and initial_planets is None
+    n_target = max_planets if blind else (len(initial_planets) if initial_planets is not None else int(n_planets))
+    if n_target < 0 or n_target > MAX_PLANETS_FIT:
+        raise ValueError('the number of planets must be between 0 and %d.' % MAX_PLANETS_FIT)
+    n_usable = prob.n + prob.n_rv - prob.reject
+    if not blind and n_usable <= n_base_params + n_params_per_planet*n_target:
+        raise ValueError('%d planets (%d parameters) cannot be fit to %d usable measurements.' % (n_target, n_base_params + n_params_per_planet*n_target, n_usable))
+    if blind:
+        n_target = min(n_target, max(0, (n_usable - n_base_params - 1)//n_params_per_planet))
+
+    empty = np.zeros(0)
+    chi2_0 = prob.chi2(empty, empty, empty)[0]
+    sol, stat = settle(prob, (empty, empty, empty, chi2_0, chi2_0))
+    history = [stat]
+    rejected = None
+    if initial_planets is not None:
+        if len(initial_planets) > 0:
+            P0 = np.array([float(p['period']) for p in initial_planets])
+            sol = prob.polish(P0, 2*np.pi*np.mod(np.array([float(p['Tp']) for p in initial_planets])/P0, 1),
+                              np.array([float(p['ecc']) for p in initial_planets]), np.ones(len(P0), dtype=np.int32))
+            sol, stat = settle(prob, sol)
+            history.append(stat)
+    else:
+        beam = [sol]
+        while len(sol[0]) < n_target:
+            children = [child for parent in beam for child in _search_one_planet(prob, *parent[:3], settings)]
+            if refine and len(sol[0]) >= 1: # refine every child: a poor-looking child can refine into the best solution
+                children = [_refine_planets(prob, child, settings) for child in _dedupe(children, len(children))]
+            children = _dedupe(children, n_beam)
+            jitter_before = prob.jitter.copy()
+            best, stat = settle(prob, children[0])
+            gain = history[-1] - stat
+            if verbose:
+                print('%d planets: P = %s d, delta = %.1f' % (len(sol[0]) + 1, np.array2string(np.sort(best[0]), precision=1), gain))
+            if blind and gain < delta_chi2_min:
+                rejected = dict(periods=np.sort(best[0]), delta_chi2=gain)
+                prob.set_jitter(jitter_before) # back to the accepted model
+                break
+            beam = [best] + children[1:]
+            sol = best
+            history.append(stat)
+    return sol, history, rejected, n_target, blind
+
+def _leave_one_out(prob, sol, history, settle):
+    '''For each planet (in order of period), the increase of the detection statistic when it is removed and the other
+    planets are re-polished (and settled). The problem's adjustable parameters (jitter) are restored afterwards.'''
+    P, phi, e = sol[:3]
+    jitter = prob.jitter.copy()
+    _, stat_full = settle(prob, sol)
+    deltas = []
+    for i in np.argsort(P):
+        others = [j for j in range(len(P)) if j != i]
+        if others:
+            reduced = prob.polish(P[others], phi[others], e[others], np.ones(len(others), dtype=np.int32))
+            stat_without = settle(prob, reduced)[1]
+        else:
+            stat_without = history[0]
+        deltas.append(stat_without - stat_full)
+        prob.set_jitter(jitter)
+    return deltas
+
 def _derived_planet_quantities(theta, cov, i, m_star):
     '''
     Tp, a0, inc, Omega, w (and m_planet if m_star is given) of planet i, and their uncertainties propagated from the
@@ -586,7 +760,7 @@ def _astrometry_fit_summary(prob, P, phi, e, m_star, binned):
     order = np.argsort(P)
     P, phi, e = P[order], phi[order], e[order]
     K = len(P)
-    chi2_total, mu, worst = prob.chi2(P, phi, e)
+    chi2_total, mu, worst, _ = prob.chi2(P, phi, e)
     theta = [mu[0], mu[2], mu[4], mu[1], mu[3]]
     names = ['ra_off', 'dec_off', 'parallax', 'pmra', 'pmdec']
     for i in range(K):
@@ -720,61 +894,211 @@ def fit_astrometry_planets(t_ast_yr, psi, plx_factor, ast_obs, ast_err, n_planet
     Note: astrometry alone cannot distinguish (Omega, w) from (Omega + pi, w + pi); Omega is returned in [0, pi).
     '''
     prob = _AstrometryProblem(t_ast_yr, psi, plx_factor, ast_obs, ast_err, parallax_prior, eccentricity_prior, reject_outlier, P_min, P_max, e_max, c_funcs_plus)
-    if delta_chi2_min is None:
-        delta_chi2_min = DEFAULT_DELTA_CHI2_MIN
-    if optimizer not in OPTIMIZER_SETTINGS:
-        raise ValueError('optimizer must be one of %s.' % list(OPTIMIZER_SETTINGS))
-    settings = dict(optimizer=optimizer, n_joint=int(n_joint))
-    blind = n_planets is None and initial_planets is None
-    n_target = max_planets if blind else (len(initial_planets) if initial_planets is not None else int(n_planets))
-    if n_target < 0 or n_target > MAX_PLANETS_FIT:
-        raise ValueError('the number of planets must be between 0 and %d.' % MAX_PLANETS_FIT)
-    n_usable = prob.n - prob.reject # a model with N planets has 5 + 7N free parameters
-    if not blind and n_usable <= 5 + 7*n_target:
-        raise ValueError('%d planets (%d parameters) cannot be fit to %d usable measurements.' % (n_target, 5 + 7*n_target, n_usable))
+    sol, history, rejected, n_target, blind = _fit_planets(prob, n_planets, max_planets, delta_chi2_min, initial_planets, optimizer, n_joint,
+                                                           refine, n_beam, verbose, 5, 7)
+    result = _astrometry_fit_summary(prob, *sol[:3], m_star, binned)
+    for planet, delta in zip(result['planets'], _leave_one_out(prob, sol, history, _settle_none)):
+        planet['delta_chi2'] = delta
+    result['chi2_history'] = history
+    result['objective'] = sol[3]
     if blind:
-        n_target = min(n_target, max(0, (n_usable - 6)//7))
+        result['rejected_candidate'] = rejected
+        result['max_planets_searched'] = n_target
+    return result
 
-    P, phi, e = np.zeros(0), np.zeros(0), np.zeros(0)
-    chi2_history = [prob.chi2(P, phi, e)[0]]
-    objective = chi2_history[0]
-    rejected = None
-    if initial_planets is not None:
-        if len(initial_planets) > 0:
-            P0 = np.array([float(p['period']) for p in initial_planets])
-            P, phi, e, objective, chi2 = prob.polish(P0, 2*np.pi*np.mod(np.array([float(p['Tp']) for p in initial_planets])/P0, 1),
-                                                     np.array([float(p['ecc']) for p in initial_planets]), np.ones(len(P0), dtype=np.int32))
-            chi2_history.append(chi2)
-    else:
-        beam = [(P, phi, e, objective, chi2_history[0])]
-        while len(P) < n_target:
-            children = [child for parent in beam for child in _search_one_planet(prob, *parent[:3], settings)]
-            if refine and len(P) >= 1: # refine every child: a poor-looking child can refine into the best solution
-                children = [_refine_planets(prob, child, settings) for child in _dedupe(children, len(children))]
-            children = _dedupe(children, n_beam)
-            best = children[0]
-            gain = chi2_history[-1] - best[4]
-            if verbose:
-                print('%d planets: P = %s d, delta chi2 = %.1f' % (len(P) + 1, np.array2string(np.sort(best[0]), precision=1), gain))
-            if blind and gain < delta_chi2_min:
-                rejected = dict(periods=np.sort(best[0]), delta_chi2=gain)
-                break
-            beam = children
-            P, phi, e, objective = best[:4]
-            chi2_history.append(best[4])
+def _fit_rv_jitter(prob, P, phi, e, max_sweeps=50):
+    '''
+    Maximize the likelihood over the jitter of each RV dataset at fixed nonlinear orbital parameters (the linear
+    parameters are re-solved at every evaluation), by coordinate descent: a bounded 1D minimization in log(jitter) for
+    each dataset, plus a check of zero jitter, repeated until -2 ln L stops improving. Leaves the result in prob.
+    '''
+    from scipy.optimize import minimize_scalar
+    jitter = prob.jitter.copy()
+    scale = np.ptp(prob.rv) + np.max(prob.rv_err)
+    log_lo, log_hi = np.log(1e-6*scale), np.log(10*scale)
+    def stat(s, k):
+        trial = jitter.copy(); trial[k] = s
+        prob.set_jitter(trial)
+        return prob.minus_2_ln_like(prob.chi2(P, phi, e)[0])
+    previous = np.inf
+    for _ in range(max_sweeps):
+        for k in range(prob.n_sets):
+            res = minimize_scalar(lambda u: stat(np.exp(u), k), bounds=(log_lo, log_hi), method='bounded', options=dict(xatol=1e-7))
+            candidates = [(res.fun, np.exp(res.x)), (stat(0.0, k), 0.0), (stat(jitter[k], k), jitter[k])]
+            jitter[k] = min(candidates)[1]
+        prob.set_jitter(jitter)
+        current = prob.minus_2_ln_like(prob.chi2(P, phi, e)[0])
+        if previous - current < 1e-8:
+            break
+        previous = current
+    prob.set_jitter(jitter)
 
-    result = _astrometry_fit_summary(prob, P, phi, e, m_star, binned)
-    # significance of each planet: chi2 increase when it is removed and the other planets are re-polished
-    chi2_full = prob.chi2(P, phi, e)[0]
-    for k, i in enumerate(np.argsort(P)):
-        others = [j for j in range(len(P)) if j != i]
-        if others:
-            chi2_without = prob.polish(P[others], phi[others], e[others], np.ones(len(others), dtype=np.int32))[4]
+def _settle_rv(prob, sol):
+    '''Alternate between fitting the RV jitter (orbits fixed) and polishing the orbits (jitter fixed) until -2 ln L converges.'''
+    P, phi, e, objective, chi2 = sol
+    previous = np.inf
+    for _ in range(20):
+        _fit_rv_jitter(prob, P, phi, e)
+        if len(P) > 0:
+            P, phi, e, objective, chi2 = prob.polish(P, phi, e, np.ones(len(P), dtype=np.int32))
         else:
-            chi2_without = chi2_history[0]
-        result['planets'][k]['delta_chi2'] = chi2_without - chi2_full
-    result['chi2_history'] = chi2_history
-    result['objective'] = objective
+            chi2 = objective = prob.chi2(P, phi, e)[0]
+        stat = prob.minus_2_ln_like(chi2)
+        if previous - stat < 1e-6:
+            break
+        previous = stat
+    return (P, phi, e, objective, chi2), stat
+
+def _settle_rv_fixed_jitter(prob, sol):
+    '''Fixed jitter: the detection statistic is -2 ln L (= chi2 + a constant).'''
+    return sol, prob.minus_2_ln_like(sol[4])
+
+def _derived_rv_quantities(theta, cov, i, n_sets, m_star):
+    '''
+    Tp, K, w (and m sin i if m_star is given) of planet i, and their uncertainties propagated from the covariance
+    matrix of theta (gamma per RV dataset, then P, e, phi_p, K cos(w), K sin(w) per planet) with a central-difference
+    Jacobian. Differences of w (defined modulo 2 pi) are wrapped. m sin(i) is the companion mass for sin(i) = 1,
+    computed exactly as the inverse of get_planet_K_kms() with inc = pi/2.
+    '''
+    AU = 1.4959787e+11 # as in gaiamock.get_a0_mas()
+    sig = np.sqrt(np.abs(np.diag(cov)))
+    def derived(th):
+        Pi, ei, phii, h, c = th[n_sets + 5*i: n_sets + 5*i + 5]
+        K = np.hypot(h, c)
+        out = [phii*Pi/(2*np.pi), K, np.mod(np.arctan2(c, h), 2*np.pi)]
+        if m_star is not None: # a_star sin(i) in AU, then the companion mass for sin(i) = 1
+            a_sini_au = K*1e3*Pi*86400*np.sqrt(1 - ei**2)/(2*np.pi*AU)
+            out.append(get_dark_companion_mass(a0_mas=a_sini_au, period=Pi, parallax=1.0, m1=m_star))
+        return np.array(out)
+    g0 = derived(theta)
+    Jg = np.zeros((len(g0), len(theta)))
+    for j in range(len(theta)):
+        h = 1e-4*sig[j] if (np.isfinite(sig[j]) and sig[j] > 0) else 1e-8
+        up, down = theta.copy(), theta.copy()
+        up[j] += h; down[j] -= h
+        dg = derived(up) - derived(down)
+        dg[2] = np.angle(np.exp(1j*dg[2])) # w is defined modulo 2 pi
+        Jg[:, j] = dg/(2*h)
+    return g0, np.sqrt(np.abs(np.diag(Jg @ cov @ Jg.T)))
+
+def _rv_fit_summary(prob, P, phi, e, m_star):
+    '''Linear parameters, uncertainties (from the Jacobian of the RV residuals, at the fitted jitter), and derived quantities.'''
+    order = np.argsort(P)
+    P, phi, e = P[order], phi[order], e[order]
+    K_pl = len(P)
+    chi2, _, _, mu = prob.chi2(P, phi, e)
+    S = prob.n_sets
+    theta = list(mu[:S])
+    names = ['gamma_%d' % k for k in range(S)]
+    for i in range(K_pl):
+        h, c = mu[S + 2*i: S + 2*i + 2]
+        theta += [P[i], e[i], phi[i], h, c]
+        names += ['%s_%d' % (k, i) for k in ('period', 'ecc', 'phi_p', 'K_cos_w', 'K_sin_w')]
+    theta = np.array(theta)
+
+    # Jacobian of the normalized residuals (central differences, step 1e-8 as in gaiamock)
+    J = np.zeros((prob.n_rv, len(theta)))
+    for j in range(len(theta)):
+        up, down = theta.copy(), theta.copy()
+        up[j] += 1e-8; down[j] -= 1e-8
+        J[:, j] = (prob.rv_residuals(up, K_pl) - prob.rv_residuals(down, K_pl))/2e-8
+    JTJ = J.T @ J
+    if prob.ecc_a > 0:
+        for i in range(K_pl):
+            ei = np.clip(e[i], 1e-6, 1 - 1e-6)
+            H_e = (prob.ecc_a - 1)/ei**2 + (prob.ecc_b - 1)/(1 - ei)**2
+            if H_e > 0:
+                JTJ[S + 5*i + 1, S + 5*i + 1] += H_e
+    try:
+        cov = np.linalg.inv(JTJ)
+    except np.linalg.LinAlgError:
+        cov = np.full_like(JTJ, np.nan)
+    sig = np.sqrt(np.abs(np.diag(cov)))
+    n_par = len(theta)
+    result = dict(n_planets=K_pl, chi2=chi2, minus_2_ln_like=prob.minus_2_ln_like(chi2), n_rv=prob.n_rv, n_params=n_par,
+                  nu=prob.n_rv - n_par, chi2_red=chi2/(prob.n_rv - n_par) if prob.n_rv > n_par else np.nan,
+                  gamma=theta[:S].copy(), sig_gamma=sig[:S].copy(), jitter=prob.jitter.copy(), theta=theta, theta_names=names, cov=cov)
+
+    planets, model_planets = [], []
+    for i in range(K_pl):
+        g0, sig_g = _derived_rv_quantities(theta, cov, i, S, m_star)
+        planet = {}
+        for j, key in enumerate(('period', 'ecc', 'phi_p', 'K_cos_w', 'K_sin_w')):
+            planet[key], planet['sig_' + key] = theta[S + 5*i + j], sig[S + 5*i + j]
+        for j, key in enumerate(('Tp', 'K', 'w') + (('m_sini',) if m_star is not None else ())):
+            planet[key], planet['sig_' + key] = g0[j], sig_g[j]
+        planets.append(planet)
+        if m_star is not None:
+            model_planets.append(dict(period=planet['period'], Tp=planet['Tp'], ecc=planet['ecc'], inc=np.pi/2, w=planet['w'], m_planet=planet['m_sini']))
+    result['planets'] = planets
+    result['model_planets'] = model_planets if m_star is not None else None
+    return result
+
+def fit_rv_planets(t_rvs_yr, rv, rv_err, rv_dataset=None, n_planets=None, max_planets=3, delta_chi2_min=None, m_star=None,
+                   P_min=10., P_max=1e4, e_max=0.99, eccentricity_prior=None, fit_jitter=True, jitter=None, initial_planets=None,
+                   optimizer='periodogram_multistart', n_joint=3, refine=True, n_beam=1, verbose=False, c_funcs_plus=None):
+    '''
+    Fit radial velocities with a model of a star hosting several planets, adding one planet at a time, with the same
+    search as fit_astrometry_planets(): gaiamock's "periodogram_multistart" optimizer for each new planet (the
+    circular-orbit periodogram step becomes the generalized Lomb-Scargle periodogram with one offset per RV dataset),
+    then a joint polish of all planets and (by default) a re-search of each planet with the others held fixed. The
+    linear parameters (one systemic velocity per dataset, and K cos(w), K sin(w) for each planet) are always solved
+    exactly. The RV model is that of rv_planets_model(): w is the argument of periastron of the star's orbit.
+
+    t_rvs_yr: RV times in years relative to the reference epoch (e.g. (BJD - 2457936.875)/365.25 for DR4)
+    rv, rv_err: RVs and their uncertainties in km/s
+    rv_dataset: None (one dataset) or the dataset (instrument) index 0, 1, ..., n_sets - 1 of each RV
+    n_planets: number of planets to fit (known-N mode). If None (default), search blindly: keep adding planets while
+        -2 ln L improves by more than delta_chi2_min, up to max_planets.
+    max_planets: largest number of planets considered in blind-search mode (default 3); fewer are tried if there are
+        not enough RVs (a model with N planets has n_sets + 5N parameters, plus n_sets jitters if they are fit).
+    delta_chi2_min: detection threshold on the improvement of -2 ln L (= chi2 for fixed jitter) from adding a planet,
+        used in blind-search mode (default DEFAULT_DELTA_CHI2_MIN = 50; in simulations of noise with 40-200 RVs from
+        1-2 instruments over 6 years, with fitted jitter, spurious planets reached up to ~46, and exceeded 40 in ~1%).
+    m_star: stellar mass in Msun. If given, the minimum masses m sin(i) (and uncertainties) are computed, and
+        model_planets are returned in the format of rv_planets_model() (with inc = pi/2 and m_planet = m sin(i)).
+    P_min, P_max: period search range in days (default 10 to 1e4, as in gaiamock). The search grids are gaiamock's,
+        which become too coarse for periods much shorter than ~10 days over multi-year baselines.
+    e_max: largest eccentricity allowed (default 0.99, as in gaiamock).
+    eccentricity_prior: None (default) or (a, b): Beta(a, b) prior on each eccentricity, included in the objective
+        that is minimized (but not in the statistic used for detection).
+    fit_jitter: if True (default), fit one jitter per RV dataset (added in quadrature to rv_err) by maximum likelihood.
+        The jitter is held fixed while searching for each new planet, and then re-fit (alternating with polishing the
+        orbits) once the planet is added. If False, the jitter is fixed at its initial value.
+    jitter: initial (or, if fit_jitter is False, fixed) jitter in km/s: None (zero), a number, or one value per dataset.
+    initial_planets: optional list of starting guesses, each a dict with keys 'period', 'Tp' (days, relative to the
+        reference epoch) and 'ecc'. If given, no search is done: the planets are polished jointly from these guesses.
+    optimizer, n_joint, refine, n_beam: search settings, as in fit_astrometry_planets().
+    c_funcs_plus: from read_in_C_functions_plus() (read in automatically if None).
+
+    returns a dict with:
+        n_planets, planets (list of dicts, sorted by period, each with period, ecc, phi_p, Tp, K (km/s), w (radians),
+            K_cos_w, K_sin_w, [m_sini (Msun)], their uncertainties sig_*, and delta_chi2: the increase in -2 ln L when
+            that planet is removed and the other planets (and the jitter) are re-fit),
+        gamma, sig_gamma (one systemic velocity per dataset, km/s), jitter (km/s),
+        chi2 (with the jitter), minus_2_ln_like, chi2_history (-2 ln L, up to a constant, for 0, 1, 2, ... planets),
+        n_rv, n_params, nu, chi2_red, theta, theta_names, cov, model_planets, and, in blind-search mode,
+        rejected_candidate and max_planets_searched (as in fit_astrometry_planets()).
+    Notes: uncertainties are computed from the Jacobian at the fitted jitter (which accounts for any excess scatter),
+    without the goodness-of-fit inflation that gaiamock applies to astrometry, and do not include the uncertainty of
+    the jitter. RVs alone do not constrain inc or Omega.
+    '''
+    prob = _Problem(rv=(t_rvs_yr, rv, rv_err, rv_dataset), eccentricity_prior=eccentricity_prior, P_min=P_min, P_max=P_max, e_max=e_max,
+                    c_funcs_plus=c_funcs_plus)
+    if jitter is not None:
+        jitter = np.broadcast_to(np.asarray(jitter, dtype=float), (prob.n_sets,))
+        if np.any(jitter < 0) or not np.all(np.isfinite(jitter)):
+            raise ValueError('jitter must be non-negative.')
+        prob.set_jitter(jitter)
+    settle = _settle_rv if fit_jitter else _settle_rv_fixed_jitter
+    n_base = prob.n_sets*(2 if fit_jitter else 1)
+    sol, history, rejected, n_target, blind = _fit_planets(prob, n_planets, max_planets, delta_chi2_min, initial_planets, optimizer, n_joint,
+                                                           refine, n_beam, verbose, n_base, 5, settle)
+    result = _rv_fit_summary(prob, *sol[:3], m_star)
+    for planet, delta in zip(result['planets'], _leave_one_out(prob, sol, history, settle)):
+        planet['delta_chi2'] = delta
+    result['chi2_history'] = history
+    result['objective'] = sol[3]
     if blind:
         result['rejected_candidate'] = rejected
         result['max_planets_searched'] = n_target

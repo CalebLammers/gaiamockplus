@@ -1,4 +1,5 @@
-/* Fast routines for fitting Gaia epoch astrometry of systems with any number of planets (dark companions).
+/* Fast routines for fitting Gaia epoch astrometry and/or radial velocities of systems with any number of planets
+(dark companions).
 These are used by the fitting functions in gaiamockplus.py, and are kept separate from gaiamock's
 kepler_solve_astrometry.c so that the upstream code can be updated independently. Compile with, e.g.:
  gcc -O2 -shared -fPIC -o kepler_solve_planets.so kepler_solve_planets.c -I$(brew --prefix gsl)/include -L$(brew --prefix gsl)/lib -lgsl -lgslcblas -lm
@@ -9,13 +10,17 @@ Model: for fixed nonlinear parameters (period P, phase phi_p = 2 pi Tp/P, and ec
 along-scan astrometry is linear in 5 + 4N parameters, ordered as in gaiamock:
     ra_off, pmra, dec_off, pmdec, parallax, then (B, G, A, F) for each planet,
 with design-matrix columns sin(psi), t sin(psi), cos(psi), t cos(psi), plx_factor, X sin(psi), Y sin(psi),
-X cos(psi), Y cos(psi), where X = cos(E) - e and Y = sqrt(1 - e^2) sin(E). The linear parameters are always solved
-exactly (weighted least squares); only the 3N nonlinear parameters are searched.
+X cos(psi), Y cos(psi), where X = cos(E) - e and Y = sqrt(1 - e^2) sin(E). Likewise, the RVs are linear in
+n_sets + 2N parameters: one systemic velocity per RV dataset (instrument), then (K cos(w), K sin(w)) for each planet,
+with columns cos(nu) + e and -sin(nu) (nu: true anomaly; w: argument of periastron of the star's orbit). The linear
+parameters are always solved exactly (weighted least squares); only the 3N nonlinear parameters are searched.
 
 Options shared by most functions:
     plx_mu, plx_sig: Gaussian parallax prior parallax = plx_mu +/- plx_sig (in mas); none if plx_sig <= 0
-    reject: if 1, the epoch with the largest weighted residual of the full solution is dropped and the linear
-        solution is recomputed without it (the same "drop-one" objective as gaiamock's reject_outlier option)
+    reject: if 1, the astrometric epoch with the largest weighted residual of the full solution is dropped and the
+        linear solution is recomputed without it (the same "drop-one" objective as gaiamock's reject_outlier option)
+    rv_set, n_sets: the RV dataset (0 to n_sets - 1) of each RV, and the number of RV datasets; rv_err should include
+        any jitter, added in quadrature
     ecc_a, ecc_b: Beta(ecc_a, ecc_b) prior on each eccentricity; none if ecc_a <= 0 or ecc_b <= 0 */
 
 #include <math.h>
@@ -28,6 +33,7 @@ Options shared by most functions:
 
 #define PI 3.14159265358979 /* the same value as in gaiamock's kepler_solve_astrometry.c */
 #define GMP_MAX_PLANETS 10
+#define GMP_MAX_SETS 20 /* RV datasets; GMP_MAX_LIN must be >= GMP_MAX_SETS + 2*GMP_MAX_PLANETS */
 #define GMP_MAX_LIN (5 + 4*GMP_MAX_PLANETS)
 
 /* ---------------------------------------------------------------- Kepler's equation (as in gaiamock) */
@@ -67,17 +73,30 @@ static double gmp_solve_kepler(double Mi, double ecc){
     return EE;
 }
 
-/* ---------------------------------------------------------------- data and design matrix */
+/* ---------------------------------------------------------------- data and design matrices */
 
+#define GMP_AST 0
+#define GMP_RV 1
+
+/* One dataset: Gaia along-scan astrometry or radial velocities. For fixed nonlinear parameters of the planets, the
+model of each dataset is linear in n_base + n_pp*N parameters:
+  astrometry: n_base = 5 (ra_off, pmra, dec_off, pmdec, parallax), n_pp = 4 per planet (B, G, A, F), as in gaiamock;
+  RVs: n_base = n_sets (one systemic velocity per RV dataset), n_pp = 2 per planet (K cos(w), K sin(w)), since
+       K [cos(nu + w) + e cos(w)] = K cos(w) [cos(nu) + e] - K sin(w) sin(nu). */
 typedef struct {
-    int n;
+    int type, n;
     const double *t, *plx, *obs;
-    double *spsi, *cpsi, *w; /* sin(psi), cos(psi), and weights 1/err^2 */
-    double plx_mu, plx_sig;
-    int reject;
+    double *spsi, *cpsi, *w; /* sin(psi), cos(psi) (astrometry only), and weights 1/err^2 */
+    double plx_mu, plx_sig;  /* parallax prior (astrometry only; none if plx_sig <= 0) */
+    int reject;              /* drop the worst epoch (astrometry only) */
+    const int *set;          /* RV dataset index of each epoch (RVs only) */
+    int n_sets, n_base, n_pp;
 } gmp_data;
 
+#define GMP_COL(d, i) ((d)->n_base + (d)->n_pp*(i)) /* first column of planet i */
+
 static int gmp_data_init(gmp_data *d, int n, const double *t, const double *psi, const double *plx, const double *obs, const double *err, double plx_mu, double plx_sig, int reject){
+    d->type = GMP_AST; d->n_base = 5; d->n_pp = 4; d->set = NULL; d->n_sets = 0;
     d->n = n; d->t = t; d->plx = plx; d->obs = obs;
     d->plx_mu = plx_mu; d->plx_sig = plx_sig; d->reject = reject;
     d->spsi = (double*)malloc(3*(size_t)n*sizeof(double));
@@ -92,6 +111,21 @@ static int gmp_data_init(gmp_data *d, int n, const double *t, const double *psi,
     return 0;
 }
 
+static int gmp_data_init_rv(gmp_data *d, int n, const double *t, const double *rv, const double *rv_err, const int *set, int n_sets){
+    d->type = GMP_RV; d->n_base = n_sets; d->n_pp = 2; d->set = set; d->n_sets = n_sets;
+    d->n = n; d->t = t; d->plx = NULL; d->obs = rv;
+    d->plx_mu = 0.0; d->plx_sig = -1.0; d->reject = 0;
+    d->spsi = (double*)malloc((size_t)n*sizeof(double));
+    if (d->spsi == NULL) return 1;
+    d->cpsi = NULL;
+    d->w = d->spsi;
+    for (int j = 0; j < n; j++){
+        if (set[j] < 0 || set[j] >= n_sets) { free(d->spsi); return 1; }
+        d->w[j] = 1.0/(rv_err[j]*rv_err[j]);
+    }
+    return 0;
+}
+
 static void gmp_data_free(gmp_data *d){
     free(d->spsi);
 }
@@ -99,6 +133,11 @@ static void gmp_data_free(gmp_data *d){
 /* columns are stored column-major: column k is A[k*n ... k*n + n - 1] */
 static void gmp_fill_base_columns(const gmp_data *d, double *A){
     int n = d->n;
+    if (d->type == GMP_RV){
+        for (int k = 0; k < d->n_sets; k++)
+            for (int j = 0; j < n; j++) A[k*n + j] = (d->set[j] == k) ? 1.0 : 0.0;
+        return;
+    }
     for (int j = 0; j < n; j++){
         A[j] = d->spsi[j];
         A[n + j] = d->t[j]*d->spsi[j];
@@ -113,6 +152,13 @@ static void gmp_fill_planet_columns(const gmp_data *d, double *A, int col0, doub
     double sq = sqrt(1 - e*e);
     for (int j = 0; j < n; j++){
         double E = gmp_solve_kepler(2*PI*d->t[j]*365.25/P - phi, e);
+        if (d->type == GMP_RV){
+            double denom = 1 - e*cos(E);
+            double cos_nu = (cos(E) - e)/denom, sin_nu = sq*sin(E)/denom;
+            A[col0*n + j] = cos_nu + e;
+            A[(col0 + 1)*n + j] = -sin_nu;
+            continue;
+        }
         double X = cos(E) - e;
         double Y = sq*sin(E);
         A[col0*n + j] = X*d->spsi[j];
@@ -122,12 +168,18 @@ static void gmp_fill_planet_columns(const gmp_data *d, double *A, int col0, doub
     }
 }
 
-/* circular orbit: the phase is absorbed by the linear coefficients (as in gaiamock's periodogram) */
+/* circular orbit: the phase is absorbed by the linear coefficients (as in gaiamock's periodogram; for RVs this is
+the generalized Lomb-Scargle periodogram with one offset per RV dataset) */
 static void gmp_fill_circular_columns(const gmp_data *d, double *A, int col0, double P){
     int n = d->n;
     for (int j = 0; j < n; j++){
         double phase = 2*PI*d->t[j]*365.25/P;
         double cp = cos(phase), sp = sin(phase);
+        if (d->type == GMP_RV){
+            A[col0*n + j] = cp;
+            A[(col0 + 1)*n + j] = sp;
+            continue;
+        }
         A[col0*n + j] = cp*d->spsi[j];
         A[(col0 + 1)*n + j] = sp*d->spsi[j];
         A[(col0 + 2)*n + j] = cp*d->cpsi[j];
@@ -248,86 +300,141 @@ static double gmp_linear_solve(const gmp_data *d, int p, const double *A, double
     return chi2;
 }
 
+/* ---------------------------------------------------------------- the fitting problem: astrometry and/or RVs */
+
+/* A problem is an astrometric dataset, an RV dataset, or both. For fixed nonlinear parameters (P, phi, e) of each
+planet, the linear parameters of each dataset are solved separately, and the objective is the sum of the chi2 of the
+datasets (plus the parallax-prior term). Every exported function below takes both datasets; set n_ast = 0 or
+n_rv = 0 to leave one out. */
+typedef struct {
+    int nd;
+    gmp_data d[2];
+    double *A[2];
+} gmp_problem;
+
+#define GMP_DATA_ARGS int n_ast, const double *t, const double *psi, const double *plx, const double *obs, const double *err, \
+                      double plx_mu, double plx_sig, int reject, \
+                      int n_rv, const double *t_rv, const double *rv, const double *rv_err, const int *rv_set, int n_sets
+#define GMP_DATA_PASS n_ast, t, psi, plx, obs, err, plx_mu, plx_sig, reject, n_rv, t_rv, rv, rv_err, rv_set, n_sets
+
+static void gmp_problem_free(gmp_problem *pr){
+    for (int k = 0; k < pr->nd; k++){
+        free(pr->A[k]);
+        gmp_data_free(&pr->d[k]);
+    }
+    pr->nd = 0;
+}
+
+/* Set up the datasets, with design matrices for n_pl planets (base columns filled). Returns 0 on success. */
+static int gmp_problem_init(gmp_problem *pr, GMP_DATA_ARGS, int n_pl){
+    pr->nd = 0;
+    if (n_pl < 0 || n_pl > GMP_MAX_PLANETS || n_sets > GMP_MAX_SETS) return 1;
+    if (n_ast > 0){
+        if (gmp_data_init(&pr->d[pr->nd], n_ast, t, psi, plx, obs, err, plx_mu, plx_sig, reject)) return 1;
+        pr->A[pr->nd] = NULL;
+        pr->nd++;
+    }
+    if (n_rv > 0){
+        if (n_sets < 1 || gmp_data_init_rv(&pr->d[pr->nd], n_rv, t_rv, rv, rv_err, rv_set, n_sets)) { gmp_problem_free(pr); return 1; }
+        pr->A[pr->nd] = NULL;
+        pr->nd++;
+    }
+    if (pr->nd == 0) return 1;
+    for (int k = 0; k < pr->nd; k++){
+        gmp_data *d = &pr->d[k];
+        pr->A[k] = (double*)malloc((size_t)(d->n_base + d->n_pp*n_pl)*d->n*sizeof(double));
+        if (pr->A[k] == NULL) { gmp_problem_free(pr); return 1; }
+        gmp_fill_base_columns(d, pr->A[k]);
+    }
+    return 0;
+}
+
+static void gmp_problem_fill_planet(gmp_problem *pr, int i, double P, double phi, double e){
+    for (int k = 0; k < pr->nd; k++) gmp_fill_planet_columns(&pr->d[k], pr->A[k], GMP_COL(&pr->d[k], i), P, phi, e);
+}
+
+static void gmp_problem_fill_circular(gmp_problem *pr, int i, double P){
+    for (int k = 0; k < pr->nd; k++) gmp_fill_circular_columns(&pr->d[k], pr->A[k], GMP_COL(&pr->d[k], i), P);
+}
+
+/* Solve the linear parameters of each dataset for n_pl planets. parts (if not NULL) receives the astrometric chi2,
+the parallax-prior term and the RV chi2; worst (if not NULL) the index of the rejected astrometric epoch (-1 if none);
+mu_ast and mu_rv (if not NULL) the linear parameters. Returns the sum of the chi2 and the prior term. */
+static double gmp_problem_solve(gmp_problem *pr, int n_pl, double *parts, int *worst, double *mu_ast, double *mu_rv){
+    double total = 0.0, mu[GMP_MAX_LIN];
+    if (parts != NULL) parts[0] = parts[1] = parts[2] = 0.0;
+    if (worst != NULL) *worst = -1;
+    for (int k = 0; k < pr->nd; k++){
+        gmp_data *d = &pr->d[k];
+        int p = d->n_base + d->n_pp*n_pl, w;
+        double prior;
+        double chi2 = gmp_linear_solve(d, p, pr->A[k], mu, &prior, &w);
+        total += chi2 + prior;
+        if (d->type == GMP_AST){
+            if (parts != NULL) { parts[0] = chi2; parts[1] = prior; }
+            if (worst != NULL) *worst = w;
+            if (mu_ast != NULL) memcpy(mu_ast, mu, p*sizeof(double));
+        } else {
+            if (parts != NULL) parts[2] = chi2;
+            if (mu_rv != NULL) memcpy(mu_rv, mu, p*sizeof(double));
+        }
+    }
+    return total;
+}
+
 /* ---------------------------------------------------------------- exported: chi2 at fixed nonlinear parameters */
 
-/* out[0] = data chi2, out[1] = parallax-prior term, out[2] = index of the rejected epoch (-1 if none).
-mu (length 5 + 4*n_pl) receives ra_off, pmra, dec_off, pmdec, parallax, then (B, G, A, F) for each planet. */
-void gmp_astrometry_chi2(int n_obs, const double *t, const double *psi, const double *plx, const double *obs, const double *err,
-                         int n_pl, const double *P, const double *phi, const double *e,
-                         double plx_mu, double plx_sig, int reject, double *out, double *mu){
-    out[0] = out[1] = NAN; out[2] = -1;
-    if (n_pl < 0 || n_pl > GMP_MAX_PLANETS) return;
-    gmp_data d;
-    if (gmp_data_init(&d, n_obs, t, psi, plx, obs, err, plx_mu, plx_sig, reject)) return;
-    int p = 5 + 4*n_pl;
-    double *A = (double*)malloc((size_t)p*n_obs*sizeof(double));
-    if (A != NULL){
-        gmp_fill_base_columns(&d, A);
-        for (int i = 0; i < n_pl; i++) gmp_fill_planet_columns(&d, A, 5 + 4*i, P[i], phi[i], e[i]);
-        double prior; int worst;
-        out[0] = gmp_linear_solve(&d, p, A, mu, &prior, &worst);
-        out[1] = prior;
-        out[2] = worst;
-        free(A);
-    }
-    gmp_data_free(&d);
+/* out[0] = astrometric chi2, out[1] = parallax-prior term, out[2] = RV chi2, out[3] = index of the rejected
+astrometric epoch (-1 if none). mu_ast (length 5 + 4*n_pl) receives ra_off, pmra, dec_off, pmdec, parallax, then
+(B, G, A, F) for each planet; mu_rv (length n_sets + 2*n_pl) the systemic velocities, then (K cos(w), K sin(w)) for
+each planet. Unused outputs are left untouched (pass any array). */
+void gmp_chi2(GMP_DATA_ARGS, int n_pl, const double *P, const double *phi, const double *e, double *out, double *mu_ast, double *mu_rv){
+    out[0] = out[1] = out[2] = NAN; out[3] = -1;
+    gmp_problem pr;
+    if (gmp_problem_init(&pr, GMP_DATA_PASS, n_pl)) return;
+    for (int i = 0; i < n_pl; i++) gmp_problem_fill_planet(&pr, i, P[i], phi[i], e[i]);
+    int worst;
+    gmp_problem_solve(&pr, n_pl, out, &worst, mu_ast, mu_rv);
+    out[3] = worst;
+    gmp_problem_free(&pr);
 }
 
 /* ---------------------------------------------------------------- exported: conditional periodogram */
 
-/* For each trial period, the chi2 (data + parallax prior) of a model with the n_fixed planets (at fixed P, phi, e)
+/* For each trial period, the objective (chi2 + parallax prior) of a model with the n_fixed planets (at fixed P, phi, e)
 plus one circular orbit at that period, with all linear parameters re-solved. */
-void gmp_astrometry_periodogram(int n_obs, const double *t, const double *psi, const double *plx, const double *obs, const double *err,
-                                int n_fixed, const double *P, const double *phi, const double *e,
-                                int n_trial, const double *trial_P, double plx_mu, double plx_sig, int reject, double *chi2_out){
+void gmp_periodogram(GMP_DATA_ARGS, int n_fixed, const double *P, const double *phi, const double *e,
+                     int n_trial, const double *trial_P, double *chi2_out){
     for (int k = 0; k < n_trial; k++) chi2_out[k] = NAN;
-    if (n_fixed < 0 || n_fixed + 1 > GMP_MAX_PLANETS) return;
-    gmp_data d;
-    if (gmp_data_init(&d, n_obs, t, psi, plx, obs, err, plx_mu, plx_sig, reject)) return;
-    int p = 5 + 4*(n_fixed + 1);
-    double *A = (double*)malloc((size_t)p*n_obs*sizeof(double));
-    if (A != NULL){
-        double mu[GMP_MAX_LIN], prior; int worst;
-        gmp_fill_base_columns(&d, A);
-        for (int i = 0; i < n_fixed; i++) gmp_fill_planet_columns(&d, A, 5 + 4*i, P[i], phi[i], e[i]);
-        for (int k = 0; k < n_trial; k++){
-            gmp_fill_circular_columns(&d, A, 5 + 4*n_fixed, trial_P[k]);
-            chi2_out[k] = gmp_linear_solve(&d, p, A, mu, &prior, &worst) + prior;
-        }
-        free(A);
+    gmp_problem pr;
+    if (gmp_problem_init(&pr, GMP_DATA_PASS, n_fixed + 1)) return;
+    for (int i = 0; i < n_fixed; i++) gmp_problem_fill_planet(&pr, i, P[i], phi[i], e[i]);
+    for (int k = 0; k < n_trial; k++){
+        gmp_problem_fill_circular(&pr, n_fixed, trial_P[k]);
+        chi2_out[k] = gmp_problem_solve(&pr, n_fixed + 1, NULL, NULL, NULL, NULL);
     }
-    gmp_data_free(&d);
+    gmp_problem_free(&pr);
 }
 
 /* ---------------------------------------------------------------- exported: eccentricity/phase scan for a new planet */
 
-/* chi2 (data + parallax prior) for one new planet on a grid of candidate periods, eccentricities and phases
+/* The objective (chi2 + parallax prior) for one new planet on a grid of candidate periods, eccentricities and phases
 phi_p = 2 pi k/n_phase, with the n_fixed planets held at fixed (P, phi, e). chi2_out has shape (n_cand, n_ecc, n_phase). */
-void gmp_astrometry_scan(int n_obs, const double *t, const double *psi, const double *plx, const double *obs, const double *err,
-                         int n_fixed, const double *P, const double *phi, const double *e,
-                         int n_cand, const double *cand_P, int n_ecc, const double *ecc_grid, int n_phase,
-                         double plx_mu, double plx_sig, int reject, double *chi2_out){
+void gmp_scan(GMP_DATA_ARGS, int n_fixed, const double *P, const double *phi, const double *e,
+              int n_cand, const double *cand_P, int n_ecc, const double *ecc_grid, int n_phase, double *chi2_out){
     for (int k = 0; k < n_cand*n_ecc*n_phase; k++) chi2_out[k] = NAN;
-    if (n_fixed < 0 || n_fixed + 1 > GMP_MAX_PLANETS) return;
-    gmp_data d;
-    if (gmp_data_init(&d, n_obs, t, psi, plx, obs, err, plx_mu, plx_sig, reject)) return;
-    int p = 5 + 4*(n_fixed + 1);
-    double *A = (double*)malloc((size_t)p*n_obs*sizeof(double));
-    if (A != NULL){
-        double mu[GMP_MAX_LIN], prior; int worst;
-        gmp_fill_base_columns(&d, A);
-        for (int i = 0; i < n_fixed; i++) gmp_fill_planet_columns(&d, A, 5 + 4*i, P[i], phi[i], e[i]);
-        for (int ic = 0; ic < n_cand; ic++){
-            for (int ie = 0; ie < n_ecc; ie++){
-                for (int ip = 0; ip < n_phase; ip++){
-                    gmp_fill_planet_columns(&d, A, 5 + 4*n_fixed, cand_P[ic], 2*PI*ip/n_phase, ecc_grid[ie]);
-                    chi2_out[(ic*n_ecc + ie)*n_phase + ip] = gmp_linear_solve(&d, p, A, mu, &prior, &worst) + prior;
-                }
+    gmp_problem pr;
+    if (gmp_problem_init(&pr, GMP_DATA_PASS, n_fixed + 1)) return;
+    for (int i = 0; i < n_fixed; i++) gmp_problem_fill_planet(&pr, i, P[i], phi[i], e[i]);
+    for (int ic = 0; ic < n_cand; ic++){
+        for (int ie = 0; ie < n_ecc; ie++){
+            for (int ip = 0; ip < n_phase; ip++){
+                gmp_problem_fill_planet(&pr, n_fixed, cand_P[ic], 2*PI*ip/n_phase, ecc_grid[ie]);
+                chi2_out[(ic*n_ecc + ie)*n_phase + ip] = gmp_problem_solve(&pr, n_fixed + 1, NULL, NULL, NULL, NULL);
             }
         }
-        free(A);
     }
-    gmp_data_free(&d);
+    gmp_problem_free(&pr);
 }
 
 /* ---------------------------------------------------------------- Nelder-Mead polish of the nonlinear parameters */
@@ -338,15 +445,14 @@ static double gmp_log_beta(double x, double a, double b){
 }
 
 typedef struct {
-    const gmp_data *d;
+    gmp_problem *pr;
     int n_pl, n_free;
     int free_idx[GMP_MAX_PLANETS];
-    double *A;
     double logP[GMP_MAX_PLANETS], phi[GMP_MAX_PLANETS], e[GMP_MAX_PLANETS];
     double L[3], U[3]; /* bounds on (P, phi, e), as in gaiamock */
     int smooth;        /* coordinates: 0 = (log P, phi, e) as in gaiamock; 1 = (log P, e cos(phi), e sin(phi)) */
     double ecc_a, ecc_b;
-    double last_chi2, last_prior, last_ecc_prior;
+    double last_parts[3], last_ecc_prior; /* astrometric chi2, parallax-prior term, RV chi2; eccentricity-prior term */
 } gmp_obj;
 
 /* The optimizer works in one of two coordinate systems for each free planet:
@@ -388,22 +494,20 @@ static void gmp_x_to_planet(const gmp_obj *o, const double *v, double *logP, dou
     }
 }
 
-/* objective = data chi2 + parallax-prior term - 2 sum ln Beta(e_i) (if an eccentricity prior is used) */
+/* objective = chi2 of all datasets + parallax-prior term - 2 sum ln Beta(e_i) (if an eccentricity prior is used) */
 static double gmp_objective(gmp_obj *o, const double *x){
     for (int k = 0; k < o->n_free; k++){
         int i = o->free_idx[k];
         gmp_x_to_planet(o, x + 3*k, &o->logP[i], &o->phi[i], &o->e[i]);
-        gmp_fill_planet_columns(o->d, o->A, 5 + 4*i, exp(o->logP[i]), o->phi[i], o->e[i]);
+        gmp_problem_fill_planet(o->pr, i, exp(o->logP[i]), o->phi[i], o->e[i]);
     }
     double ecc_prior = 0.0;
     if (o->ecc_a > 0 && o->ecc_b > 0){
         for (int i = 0; i < o->n_pl; i++) ecc_prior += -2.0*gmp_log_beta(o->e[i], o->ecc_a, o->ecc_b);
         if (!isfinite(ecc_prior)) return INFINITY;
     }
-    double mu[GMP_MAX_LIN], prior; int worst;
-    double chi2 = gmp_linear_solve(o->d, 5 + 4*o->n_pl, o->A, mu, &prior, &worst);
-    o->last_chi2 = chi2; o->last_prior = prior; o->last_ecc_prior = ecc_prior;
-    double f = chi2 + prior + ecc_prior;
+    double f = gmp_problem_solve(o->pr, o->n_pl, o->last_parts, NULL, NULL, NULL) + ecc_prior;
+    o->last_ecc_prior = ecc_prior;
     return isfinite(f) ? f : INFINITY;
 }
 
@@ -495,22 +599,18 @@ static double gmp_nelder_mead(gmp_obj *o, double *x, int n, const double *step, 
     return fbest;
 }
 
-/* Set up the objective for n_pl planets, with the planets flagged in free_flags free and the others fixed.
-Returns 0 on success (then free o->A and the data with gmp_obj_free). */
-static int gmp_obj_init(gmp_obj *o, gmp_data *d, int n_pl, const double *P, const double *phi, const double *e, const int *free_flags,
-                        const double *L, const double *U, double ecc_a, double ecc_b, int smooth){
-    o->d = d; o->n_pl = n_pl; o->n_free = 0; o->smooth = smooth;
+/* Set up the objective for n_pl planets of an initialized problem, with the planets flagged in free_flags free and the
+others fixed (their columns are filled once). */
+static void gmp_obj_init(gmp_obj *o, gmp_problem *pr, int n_pl, const double *P, const double *phi, const double *e, const int *free_flags,
+                         const double *L, const double *U, double ecc_a, double ecc_b, int smooth){
+    o->pr = pr; o->n_pl = n_pl; o->n_free = 0; o->smooth = smooth;
     for (int c = 0; c < 3; c++) { o->L[c] = L[c]; o->U[c] = U[c]; }
     o->ecc_a = ecc_a; o->ecc_b = ecc_b;
-    o->A = (double*)malloc((size_t)(5 + 4*n_pl)*d->n*sizeof(double));
-    if (o->A == NULL) return 1;
-    gmp_fill_base_columns(d, o->A);
     for (int i = 0; i < n_pl; i++){
         o->logP[i] = log(P[i]); o->phi[i] = phi[i]; o->e[i] = e[i];
         if (free_flags[i]) o->free_idx[o->n_free++] = i;
-        else gmp_fill_planet_columns(d, o->A, 5 + 4*i, P[i], phi[i], e[i]);
+        else gmp_problem_fill_planet(pr, i, P[i], phi[i], e[i]);
     }
-    return 0;
 }
 
 /* Run Nelder-Mead on the free planets from their current (P, phi, e), with gaiamock's initial step sizes
@@ -549,26 +649,23 @@ Nelder-Mead within the bounds L <= (P, phi, e) <= U, in (log P, phi, e) as in ga
 (log P, e cos(phi), e sin(phi)) (smooth = 1; see gmp_constrain), restarted up to max_restarts times. Each run
 stops when the objective and coordinates of the simplex vertices agree to within ftol and xtol, or after max_iter
 iterations. P, phi and e are updated in place (fixed planets are returned untouched).
-out[0] = objective, out[1] = data chi2, out[2] = parallax-prior term, out[3] = eccentricity-prior term. */
-void gmp_astrometry_polish(int n_obs, const double *t, const double *psi, const double *plx, const double *obs, const double *err,
-                           int n_pl, double *P, double *phi, double *e, const int *free_flags, const double *L, const double *U,
-                           double plx_mu, double plx_sig, double ecc_a, double ecc_b, int reject,
-                           int max_iter, double ftol, double xtol, int max_restarts, int smooth, double *out){
-    out[0] = out[1] = out[2] = out[3] = NAN;
-    if (n_pl < 1 || n_pl > GMP_MAX_PLANETS) return;
-    gmp_data d;
-    if (gmp_data_init(&d, n_obs, t, psi, plx, obs, err, plx_mu, plx_sig, reject)) return;
+out[0] = objective, out[1] = astrometric chi2, out[2] = parallax-prior term, out[3] = eccentricity-prior term,
+out[4] = RV chi2. */
+void gmp_polish(GMP_DATA_ARGS, int n_pl, double *P, double *phi, double *e, const int *free_flags, const double *L, const double *U,
+                double ecc_a, double ecc_b, int max_iter, double ftol, double xtol, int max_restarts, int smooth, double *out){
+    out[0] = out[1] = out[2] = out[3] = out[4] = NAN;
+    if (n_pl < 1) return;
+    gmp_problem pr;
+    if (gmp_problem_init(&pr, GMP_DATA_PASS, n_pl)) return;
     gmp_obj o;
-    if (gmp_obj_init(&o, &d, n_pl, P, phi, e, free_flags, L, U, ecc_a, ecc_b, smooth) == 0){
-        out[0] = gmp_obj_polish(&o, max_iter, ftol, xtol, max_restarts);
-        out[1] = o.last_chi2; out[2] = o.last_prior; out[3] = o.last_ecc_prior;
-        for (int k = 0; k < o.n_free; k++){
-            int i = o.free_idx[k];
-            P[i] = exp(o.logP[i]); phi[i] = o.phi[i]; e[i] = o.e[i];
-        }
-        free(o.A);
+    gmp_obj_init(&o, &pr, n_pl, P, phi, e, free_flags, L, U, ecc_a, ecc_b, smooth);
+    out[0] = gmp_obj_polish(&o, max_iter, ftol, xtol, max_restarts);
+    out[1] = o.last_parts[0]; out[2] = o.last_parts[1]; out[3] = o.last_ecc_prior; out[4] = o.last_parts[2];
+    for (int k = 0; k < o.n_free; k++){
+        int i = o.free_idx[k];
+        P[i] = exp(o.logP[i]); phi[i] = o.phi[i]; e[i] = o.e[i];
     }
-    gmp_data_free(&d);
+    gmp_problem_free(&pr);
 }
 
 /* ---------------------------------------------------------------- exported: gaiamock's multistart search for one more planet */
@@ -611,8 +708,8 @@ static int gmp_start_is_distinct(gmp_cand c, const gmp_cand *starts, int n){
 
 /* Search for one more planet, given n_fixed planets whose (P, phi, e) are held fixed. This is gaiamock's
 "periodogram_multistart" optimizer (run_astfit_periodogram_multistart_config in kepler_solve_astrometry.c), with
-the fixed planets included in every chi2 evaluation (and all linear parameters re-solved); for n_fixed = 0 it is the
-same algorithm:
+the fixed planets included in every chi2 evaluation (and all linear parameters re-solved), and with the objective of
+the problem (astrometry, RVs, or both); for astrometry with n_fixed = 0 it is the same algorithm:
   1. a circular-orbit periodogram on log-uniform period grids (n_period periods between L[0] and U[0], plus
      n_short_period periods between L[0] and min(U[0], 300 d));
   2. the best periods that are distinct by 2.5% (up to max_periods_keep), plus 8 long periods U[0] exp(-i/7);
@@ -620,33 +717,27 @@ same algorithm:
      periods (e = 0, 0.2, 0.4, 0.6, 0.8, 0.95 within the bounds; n_ecc_phase phases), keeping the best 256;
   4. Nelder-Mead polish of the new planet from the best max_starts distinct candidates, with gaiamock's default
      tolerances (full_nm = 0: 250 iterations, 1e-4, 3e-6) or those of its "full" optimizer (full_nm = 1: 400, 1e-6, 1e-7).
-The objective is the data chi2 + parallax-prior term (+ the eccentricity-prior term in the polish).
+The objective is the chi2 + parallax-prior term (+ the eccentricity-prior term in the polish).
 out (4 x max_starts) receives (P, phi, e, objective) of every polished start, sorted by objective; *n_out their number. */
-void gmp_astrometry_multistart(int n_obs, const double *t, const double *psi, const double *plx, const double *obs, const double *err,
-                               int n_fixed, const double *P, const double *phi, const double *e, const double *L, const double *U,
-                               double plx_mu, double plx_sig, double ecc_a, double ecc_b, int reject,
-                               int n_period, int n_short_period, int n_ecc_phase, int max_periods_keep, int max_starts, int full_nm,
-                               double *out, int *n_out){
+void gmp_multistart(GMP_DATA_ARGS, int n_fixed, const double *P, const double *phi, const double *e, const double *L, const double *U,
+                    double ecc_a, double ecc_b, int n_period, int n_short_period, int n_ecc_phase, int max_periods_keep, int max_starts,
+                    int full_nm, double *out, int *n_out){
     *n_out = 0;
-    if (n_fixed < 0 || n_fixed + 1 > GMP_MAX_PLANETS) return;
-    gmp_data d;
-    if (gmp_data_init(&d, n_obs, t, psi, plx, obs, err, plx_mu, plx_sig, reject)) return;
-    int n_pl = n_fixed + 1, p = 5 + 4*n_pl, col = 5 + 4*n_fixed;
+    gmp_problem pr;
+    if (gmp_problem_init(&pr, GMP_DATA_PASS, n_fixed + 1)) return;
+    int n_pl = n_fixed + 1;
     int max_periods = 32, max_candidates = 256;
     double ecc_grid[6] = {0.0, 0.2, 0.4, 0.6, 0.8, 0.95};
     double short_period_max = fmin(U[0], 300.0);
     int max_rows = n_period + ((short_period_max > L[0]) ? n_short_period : 0);
 
-    double *A = (double*)malloc((size_t)p*n_obs*sizeof(double));
     gmp_cand *rows = (gmp_cand*)malloc((size_t)max_rows*sizeof(gmp_cand));
     gmp_cand *cand = (gmp_cand*)malloc((size_t)max_candidates*sizeof(gmp_cand));
     gmp_cand *starts = (gmp_cand*)malloc((size_t)max_starts*sizeof(gmp_cand));
     double periods[32];
-    if (A == NULL || rows == NULL || cand == NULL || starts == NULL) goto cleanup;
-    gmp_fill_base_columns(&d, A);
-    for (int i = 0; i < n_fixed; i++) gmp_fill_planet_columns(&d, A, 5 + 4*i, P[i], phi[i], e[i]);
+    if (rows == NULL || cand == NULL || starts == NULL) goto cleanup;
+    for (int i = 0; i < n_fixed; i++) gmp_problem_fill_planet(&pr, i, P[i], phi[i], e[i]);
 
-    double mu[GMP_MAX_LIN], prior; int worst;
     /* 1. circular-orbit periodogram */
     int n_rows = 0;
     for (int grid = 0; grid < 2; grid++){
@@ -656,8 +747,8 @@ void gmp_astrometry_multistart(int n_obs, const double *t, const double *psi, co
         for (int ip = 0; ip < n_grid; ip++){
             double frac = (n_grid == 1) ? 0.0 : ((double)ip/(double)(n_grid - 1));
             double Ptrial = exp(log(L[0]) + frac*(log(Pmax) - log(L[0])));
-            gmp_fill_circular_columns(&d, A, col, Ptrial);
-            double chi2 = gmp_linear_solve(&d, p, A, mu, &prior, &worst) + prior;
+            gmp_problem_fill_circular(&pr, n_fixed, Ptrial);
+            double chi2 = gmp_problem_solve(&pr, n_pl, NULL, NULL, NULL, NULL);
             rows[n_rows].chi2 = isfinite(chi2) ? chi2 : INFINITY;
             rows[n_rows].P = Ptrial; rows[n_rows].phi = 0.0; rows[n_rows].e = 0.0;
             n_rows++;
@@ -683,8 +774,8 @@ void gmp_astrometry_multistart(int n_obs, const double *t, const double *psi, co
             if (ecc_grid[ie] < L[2] || ecc_grid[ie] > U[2]) continue;
             for (int iph = 0; iph < n_ecc_phase; iph++){
                 double ph = L[1] + ((double)iph/(double)n_ecc_phase)*(U[1] - L[1]);
-                gmp_fill_planet_columns(&d, A, col, periods[ip], ph, ecc_grid[ie]);
-                double chi2 = gmp_linear_solve(&d, p, A, mu, &prior, &worst) + prior;
+                gmp_problem_fill_planet(&pr, n_fixed, periods[ip], ph, ecc_grid[ie]);
+                double chi2 = gmp_problem_solve(&pr, n_pl, NULL, NULL, NULL, NULL);
                 gmp_insert_candidate(cand, &n_cand, max_candidates, chi2, periods[ip], ph, ecc_grid[ie]);
             }
         }
@@ -702,15 +793,13 @@ void gmp_astrometry_multistart(int n_obs, const double *t, const double *psi, co
     gmp_cand *results = cand; /* reuse the candidate buffer for the polished results */
     int n_res = 0;
     for (int k = 0; k < n_starts; k++){
-        /* the start's P may be outside [L, U] only through rounding; clamp as gaiamock does */
         Pall[n_fixed] = starts[k].P; phiall[n_fixed] = starts[k].phi; eall[n_fixed] = starts[k].e;
         gmp_obj o;
-        if (gmp_obj_init(&o, &d, n_pl, Pall, phiall, eall, free_flags, L, U, ecc_a, ecc_b, 0)) break; /* gaiamock's coordinates */
+        gmp_obj_init(&o, &pr, n_pl, Pall, phiall, eall, free_flags, L, U, ecc_a, ecc_b, 0); /* gaiamock's coordinates */
         double f = full_nm ? gmp_obj_polish(&o, 400, 1e-6, 1e-7, 0) : gmp_obj_polish(&o, 250, 1e-4, 3e-6, 0);
         results[n_res].chi2 = isfinite(f) ? f : INFINITY;
         results[n_res].P = exp(o.logP[n_fixed]); results[n_res].phi = o.phi[n_fixed]; results[n_res].e = o.e[n_fixed];
         n_res++;
-        free(o.A);
     }
     qsort(results, n_res, sizeof(gmp_cand), gmp_cand_compare);
     for (int k = 0; k < n_res; k++){
@@ -719,8 +808,8 @@ void gmp_astrometry_multistart(int n_obs, const double *t, const double *psi, co
     *n_out = n_res;
 
 cleanup:
-    free(A); free(rows); free(cand); free(starts);
-    gmp_data_free(&d);
+    free(rows); free(cand); free(starts);
+    gmp_problem_free(&pr);
 }
 
 /* ---------------------------------------------------------------- exported: residuals for the Jacobian */
@@ -741,5 +830,23 @@ void gmp_astrometry_residuals(int n_obs, const double *t, const double *psi, con
             dec += q[3]*X + q[5]*Y; /* A X + F Y */
         }
         resid[j] = (ra*s + dec*c + theta[2]*plx[j] - obs[j])/err[j];
+    }
+}
+
+/* Normalized RV residuals (model - rv)/rv_err for the full parameter vector
+theta = (gamma_0, ..., gamma_{n_sets - 1}, then for each planet: P, e, phi_p, K cos(w), K sin(w)),
+where the model is gamma_{set} + sum over planets of K [cos(nu + w) + e cos(w)]. */
+void gmp_rv_residuals(int n_rv, const double *t_rv, const double *rv, const double *rv_err, const int *rv_set, int n_sets,
+                      int n_pl, const double *theta, double *resid){
+    for (int j = 0; j < n_rv; j++){
+        double model = theta[rv_set[j]];
+        for (int i = 0; i < n_pl; i++){
+            const double *q = theta + n_sets + 5*i;
+            double E = gmp_solve_kepler(2*PI*t_rv[j]*365.25/q[0] - q[2], q[1]);
+            double denom = 1 - q[1]*cos(E);
+            double cos_nu = (cos(E) - q[1])/denom, sin_nu = sqrt(1 - q[1]*q[1])*sin(E)/denom;
+            model += q[3]*(cos_nu + q[1]) - q[4]*sin_nu;
+        }
+        resid[j] = (model - rv[j])/rv_err[j];
     }
 }
