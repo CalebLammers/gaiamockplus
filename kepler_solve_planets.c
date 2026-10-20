@@ -707,11 +707,13 @@ static int gmp_start_is_distinct(gmp_cand c, const gmp_cand *starts, int n){
 }
 
 /* Search for one more planet, given n_fixed planets whose (P, phi, e) are held fixed. This is gaiamock's
-"periodogram_multistart" optimizer (run_astfit_periodogram_multistart_config in kepler_solve_astrometry.c), with
-the fixed planets included in every chi2 evaluation (and all linear parameters re-solved), and with the objective of
-the problem (astrometry, RVs, or both); for astrometry with n_fixed = 0 it is the same algorithm:
+"periodogram_multistart" optimizer (run_astfit_periodogram_multistart_config in kepler_solve_astrometry.c), or, if
+n_circ_phase > 0, its "multistart" optimizer (run_astfit_grid_multistart), with the fixed planets included in every
+chi2 evaluation (and all linear parameters re-solved), and with the objective of the problem (astrometry, RVs, or
+both); for astrometry with n_fixed = 0 it is the same algorithm:
   1. a circular-orbit periodogram on log-uniform period grids (n_period periods between L[0] and U[0], plus
-     n_short_period periods between L[0] and min(U[0], 300 d));
+     n_short_period periods between L[0] and min(U[0], 300 d)); with n_circ_phase > 0, each period is instead scored
+     by the best chi2 of circular orbits at n_circ_phase phases (as gaiamock's scan_circular_period_grid);
   2. the best periods that are distinct by 2.5% (up to max_periods_keep), plus 8 long periods U[0] exp(-i/7);
   3. candidates: the 128 best periodogram rows (as circular orbits) and an eccentricity/phase scan of the kept
      periods (e = 0, 0.2, 0.4, 0.6, 0.8, 0.95 within the bounds; n_ecc_phase phases), keeping the best 256;
@@ -721,7 +723,7 @@ The objective is the chi2 + parallax-prior term (+ the eccentricity-prior term i
 out (4 x max_starts) receives (P, phi, e, objective) of every polished start, sorted by objective; *n_out their number. */
 void gmp_multistart(GMP_DATA_ARGS, int n_fixed, const double *P, const double *phi, const double *e, const double *L, const double *U,
                     double ecc_a, double ecc_b, int n_period, int n_short_period, int n_ecc_phase, int max_periods_keep, int max_starts,
-                    int full_nm, double *out, int *n_out){
+                    int full_nm, int n_circ_phase, double *out, int *n_out){
     *n_out = 0;
     gmp_problem pr;
     if (gmp_problem_init(&pr, GMP_DATA_PASS, n_fixed + 1)) return;
@@ -747,10 +749,20 @@ void gmp_multistart(GMP_DATA_ARGS, int n_fixed, const double *P, const double *p
         for (int ip = 0; ip < n_grid; ip++){
             double frac = (n_grid == 1) ? 0.0 : ((double)ip/(double)(n_grid - 1));
             double Ptrial = exp(log(L[0]) + frac*(log(Pmax) - log(L[0])));
-            gmp_problem_fill_circular(&pr, n_fixed, Ptrial);
-            double chi2 = gmp_problem_solve(&pr, n_pl, NULL, NULL, NULL, NULL);
+            double chi2 = INFINITY, phi_row = (n_circ_phase > 0) ? L[1] : 0.0;
+            if (n_circ_phase > 0){
+                for (int iph = 0; iph < n_circ_phase; iph++){
+                    double ph = L[1] + ((double)iph/(double)n_circ_phase)*(U[1] - L[1]);
+                    gmp_problem_fill_planet(&pr, n_fixed, Ptrial, ph, 0.0);
+                    double c = gmp_problem_solve(&pr, n_pl, NULL, NULL, NULL, NULL);
+                    if (c < chi2) { chi2 = c; phi_row = ph; }
+                }
+            } else {
+                gmp_problem_fill_circular(&pr, n_fixed, Ptrial);
+                chi2 = gmp_problem_solve(&pr, n_pl, NULL, NULL, NULL, NULL);
+            }
             rows[n_rows].chi2 = isfinite(chi2) ? chi2 : INFINITY;
-            rows[n_rows].P = Ptrial; rows[n_rows].phi = 0.0; rows[n_rows].e = 0.0;
+            rows[n_rows].P = Ptrial; rows[n_rows].phi = phi_row; rows[n_rows].e = 0.0;
             n_rows++;
         }
     }
@@ -809,6 +821,177 @@ void gmp_multistart(GMP_DATA_ARGS, int n_fixed, const double *P, const double *p
 
 cleanup:
     free(rows); free(cand); free(starts);
+    gmp_problem_free(&pr);
+}
+
+/* ---------------------------------------------------------------- exported: gaiamock's simulated annealing for one more planet */
+
+static double gmp_random_double(void){
+    return (double)rand() / (double)RAND_MAX; /* as gaiamock's random_double() */
+}
+
+/* as gaiamock's generate_xnew_from_generation_temperatures() */
+static void gmp_generate_xnew(const double *x, const double *L, const double *U, const double *Tgen, int len, double *xnew){
+    for (int i = 0; i < len; i++) xnew[i] = x[i];
+    for (int g = 0; g < len; g++){
+        while (1){
+            double r = gmp_random_double();
+            int sgn = (r - 0.5) >= 0 ? 1 : -1;
+            double q = sgn*Tgen[g]*(pow((1.0 + 1.0/Tgen[g]), fabs(2*r - 1)) - 1);
+            xnew[g] = x[g] + q*(U[g] - L[g]);
+            if (L[g] <= xnew[g] && xnew[g] <= U[g]) break;
+        }
+    }
+}
+
+/* the objective at (P, phi, e) of the new planet (linear coordinates, as in gaiamock's annealing) */
+static double gmp_anneal_objective(gmp_obj *o, const double *xl){
+    double x[3] = {log(xl[0]), xl[1], xl[2]};
+    return gmp_objective(o, x);
+}
+
+/* Search for one more planet, given n_fixed planets whose (P, phi, e) are held fixed, with gaiamock's "annealing"
+optimizer: adaptive simulated annealing of (P, phi, e) within L <= (P, phi, e) <= U, started at (L + U)/2, with the
+tunable parameters of RVFIT (Iglesias-Marzoa et al. 2015). This is a line-by-line port of run_astfit() in
+kepler_solve_astrometry.c (using rand() in the same order, so that for astrometry with n_fixed = 0 and the same
+srand() seed it follows the same path), with the objective of the problem (chi2 of all datasets + prior terms). The
+reheating threshold chislimit = sum of (mean err/err)^2 is computed for each dataset (astrometry, RVs) and summed.
+If seed > 0, srand(seed) is called first. out = (P, phi, e, objective) of the best point. */
+void gmp_anneal(GMP_DATA_ARGS, int n_fixed, const double *P, const double *phi, const double *e, const double *L, const double *U,
+                double ecc_a, double ecc_b, unsigned int seed, double *out){
+    out[0] = out[1] = out[2] = out[3] = NAN;
+    gmp_problem pr;
+    if (gmp_problem_init(&pr, GMP_DATA_PASS, n_fixed + 1)) return;
+    if (seed > 0) srand(seed);
+    int n_pl = n_fixed + 1;
+    double Pall[GMP_MAX_PLANETS], phiall[GMP_MAX_PLANETS], eall[GMP_MAX_PLANETS];
+    int free_flags[GMP_MAX_PLANETS];
+    for (int i = 0; i < n_fixed; i++) { Pall[i] = P[i]; phiall[i] = phi[i]; eall[i] = e[i]; free_flags[i] = 0; }
+    Pall[n_fixed] = (L[0] + U[0])/2.0; phiall[n_fixed] = (L[1] + U[1])/2.0; eall[n_fixed] = (L[2] + U[2])/2.0;
+    free_flags[n_fixed] = 1;
+    gmp_obj o;
+    gmp_obj_init(&o, &pr, n_pl, Pall, phiall, eall, free_flags, L, U, ecc_a, ecc_b, 0);
+
+    double eps = 1e-5; /* all the tunable parameters are taken from RVFIT, as in gaiamock */
+    int Neps = 5, Nterm = 20;
+    enum { npar = 3 };
+    double fbestlist[5];
+    for (int i = 0; i < Neps; i++) fbestlist[i] = 1.0;
+    int nrean = 0;
+
+    double chislimit = 0.0;
+    for (int k = 0; k < pr.nd; k++){
+        const gmp_data *d = &pr.d[k];
+        double mean_err = 0.0;
+        for (int j = 0; j < d->n; j++) mean_err += 1.0/sqrt(d->w[j]);
+        mean_err /= d->n;
+        for (int j = 0; j < d->n; j++) chislimit += mean_err*mean_err*d->w[j];
+    }
+
+    double x[npar], xbest[npar];
+    for (int i = 0; i < npar; i++) x[i] = (U[i] + L[i])/2.0;
+    double f = gmp_anneal_objective(&o, x);
+    double fbest = f;
+    for (int i = 0; i < npar; i++) xbest[i] = x[i];
+
+    int ka = 0;
+    double Ta0 = f, Ta = Ta0;
+    int nacep = 0;
+    double kgen[npar] = {0.0, 0.0, 0.0}, Tgen0[npar], Tgen[npar], delta[npar];
+    for (int i = 0; i < npar; i++) { Tgen0[i] = 1.0; Tgen[i] = Tgen0[i]; delta[i] = fabs(U[i] - L[i])*1e-8; }
+    double c = 20.0;
+    int Na = 1000, Ngen = 10000;
+    double acep = 0.25;
+    enum { ntest = 100 };
+    double ftest[ntest];
+
+    for (int j = 0; j < ntest; j++){
+        double xnew[npar];
+        gmp_generate_xnew(x, L, U, Tgen, npar, xnew);
+        ftest[j] = gmp_anneal_objective(&o, xnew);
+        if (ftest[j] < fbest){
+            fbest = ftest[j];
+            for (int i = 0; i < npar; i++) xbest[i] = xnew[i];
+        }
+    }
+    double avdftest = 0.0;
+    for (int i = 0; i < ntest - 1; i++) avdftest += fabs(ftest[i + 1] - ftest[i]);
+    avdftest /= (ntest - 1);
+    Ta0 = avdftest/log(1.0/acep - 1.0);
+
+    int repeat = 1;
+    while (repeat){
+        for (int j = 0; j < Ngen; j++){
+            int flag_acceptance = 0;
+            double xnew[npar];
+            gmp_generate_xnew(x, L, U, Tgen, npar, xnew);
+            double fnew = gmp_anneal_objective(&o, xnew);
+            if (fnew <= f){
+                flag_acceptance = 1;
+            } else {
+                double test = (fnew - f)/Ta;
+                double Pa = (test > 20) ? 0 : 1.0/(1.0 + exp(test));
+                if (gmp_random_double() <= Pa) flag_acceptance = 1;
+            }
+            if (flag_acceptance){
+                if (fnew < fbest){
+                    fbest = fnew;
+                    for (int i = 0; i < npar; i++) xbest[i] = xnew[i];
+                    nrean = 0;
+                }
+                nacep++;
+                ka++;
+                for (int i = 0; i < npar; i++) x[i] = xnew[i];
+                f = fnew;
+            }
+            if (nacep >= Na){
+                double s[npar];
+                for (int g = 0; g < npar; g++){
+                    double xdelta[npar];
+                    for (int i = 0; i < npar; i++) xdelta[i] = xbest[i];
+                    xdelta[g] += delta[g];
+                    s[g] = fabs((gmp_anneal_objective(&o, xdelta) - fbest)/delta[g]);
+                }
+                for (int i = 0; i < npar; i++){
+                    if (s[i] == 0.0){
+                        double min_nonzero = 1e10;
+                        for (int k = 0; k < npar; k++) if (s[k] != 0.0 && s[k] < min_nonzero) min_nonzero = s[k];
+                        s[i] = min_nonzero;
+                    }
+                }
+                double smax = 0.0;
+                for (int i = 0; i < npar; i++) if (s[i] > smax) smax = s[i];
+                for (int i = 0; i < npar; i++){
+                    Tgen[i] = Tgen[i]*(smax/s[i]);
+                    kgen[i] = fabs(pow(log(Tgen0[i]/Tgen[i])/c, npar));
+                }
+                Ta0 = f;
+                Ta = fbest;
+                ka = pow(log(Ta0/Ta)/c, npar); /* truncated to an integer, as in gaiamock */
+                int stop = 0;
+                for (int i = 0; i < npar; i++) if (Tgen[i] == 0) { stop = 1; break; }
+                if (stop) { repeat = 0; break; }
+                nacep = 0;
+                nrean++;
+            }
+        }
+        for (int i = 0; i < npar; i++){
+            kgen[i] += 1;
+            Tgen[i] = Tgen0[i]*exp(-c*pow(kgen[i], 1.0/npar));
+        }
+        ka += 1;
+        Ta = Ta0*exp(-c*pow(ka, 1.0/npar));
+        for (int i = 1; i < Neps; i++) fbestlist[i - 1] = fbestlist[i];
+        fbestlist[Neps - 1] = fbest;
+        int count = 0;
+        for (int i = 0; i < Neps - 1; i++) if (fabs(fbestlist[i + 1] - fbestlist[i]) < eps) count++;
+        if (count == Neps - 1){
+            if (fbest < chislimit) repeat = 0;
+            else Ta = Ta0;
+        }
+        if (nrean >= Nterm) repeat = 0;
+    }
+    out[0] = xbest[0]; out[1] = xbest[1]; out[2] = xbest[2]; out[3] = fbest;
     gmp_problem_free(&pr);
 }
 

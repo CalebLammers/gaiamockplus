@@ -371,10 +371,11 @@ def read_in_C_functions_plus():
     lib.gmp_periodogram.argtypes = data + [c_int, dbl, dbl, dbl, c_int, dbl, dbl]
     lib.gmp_scan.argtypes = data + [c_int, dbl, dbl, dbl, c_int, dbl, c_int, dbl, c_int, dbl]
     lib.gmp_polish.argtypes = data + [c_int, dbl, dbl, dbl, intp, dbl, dbl, c_dbl, c_dbl, c_int, c_dbl, c_dbl, c_int, c_int, dbl]
-    lib.gmp_multistart.argtypes = data + [c_int, dbl, dbl, dbl, dbl, dbl, c_dbl, c_dbl, c_int, c_int, c_int, c_int, c_int, c_int, dbl, intp]
+    lib.gmp_multistart.argtypes = data + [c_int, dbl, dbl, dbl, dbl, dbl, c_dbl, c_dbl, c_int, c_int, c_int, c_int, c_int, c_int, c_int, dbl, intp]
+    lib.gmp_anneal.argtypes = data + [c_int, dbl, dbl, dbl, dbl, dbl, c_dbl, c_dbl, ctypes.c_uint, dbl]
     lib.gmp_astrometry_residuals.argtypes = [c_int, dbl, dbl, dbl, dbl, dbl, c_int, dbl, dbl]
     lib.gmp_rv_residuals.argtypes = [c_int, dbl, dbl, dbl, intp, c_int, c_int, dbl, dbl]
-    for name in ('gmp_chi2', 'gmp_periodogram', 'gmp_scan', 'gmp_polish', 'gmp_multistart', 'gmp_astrometry_residuals', 'gmp_rv_residuals'):
+    for name in ('gmp_chi2', 'gmp_periodogram', 'gmp_scan', 'gmp_polish', 'gmp_multistart', 'gmp_anneal', 'gmp_astrometry_residuals', 'gmp_rv_residuals'):
         getattr(lib, name).restype = None
     return lib
 
@@ -446,13 +447,17 @@ def _nonlinear_arrays(periods, phi_ps, eccs):
         raise ValueError('periods must be positive and 0 <= ecc < 1.')
     return arrays
 
-# Settings of the per-planet search, which is gaiamock's "periodogram_multistart" optimizer (see the ASTFIT_* settings
-# in kepler_solve_astrometry.c): number of periods in the main and short-period periodogram grids, number of phases in
-# the eccentricity scan, number of distinct periods scanned, number of starts polished, and whether the Nelder-Mead
-# polish uses gaiamock's "full" (tighter) tolerances.
+# Settings of the per-planet search, i.e. gaiamock's optimizers (see the ASTFIT_* settings in kepler_solve_astrometry.c).
+# For the multistart optimizers: number of periods in the main and short-period period grids, number of phases in the
+# eccentricity scan, number of distinct periods scanned, number of starts polished, whether the Nelder-Mead polish uses
+# gaiamock's "full" (tighter) tolerances, and the number of circular-orbit phases scored at each trial period (0: the
+# linear circular-orbit periodogram of "periodogram_multistart"; 8: the circular grid of gaiamock's "multistart").
+# "annealing" is gaiamock's adaptive simulated annealing.
 OPTIMIZER_SETTINGS = {
-    'periodogram_multistart': dict(n_period=180, n_short_period=560, n_ecc_phase=36, max_periods_keep=20, max_starts=48, full_nm=0),
-    'periodogram_multistart_full': dict(n_period=260, n_short_period=800, n_ecc_phase=48, max_periods_keep=24, max_starts=64, full_nm=1),
+    'periodogram_multistart': dict(n_period=180, n_short_period=560, n_ecc_phase=36, max_periods_keep=20, max_starts=48, full_nm=0, n_circ_phase=0),
+    'periodogram_multistart_full': dict(n_period=260, n_short_period=800, n_ecc_phase=48, max_periods_keep=24, max_starts=64, full_nm=1, n_circ_phase=0),
+    'multistart': dict(n_period=180, n_short_period=560, n_ecc_phase=36, max_periods_keep=20, max_starts=48, full_nm=0, n_circ_phase=8),
+    'annealing': dict(annealing=True),
 }
 
 _EMPTY_DBL = np.zeros(1)
@@ -514,16 +519,22 @@ class _Problem:
         '''-2 ln(likelihood) up to a constant: chi2 + sum of ln(2 pi sigma^2) of the RVs, which depends on the jitter.'''
         return chi2 + (np.sum(np.log(2*np.pi*self.rv_err_eff**2)) if self.n_rv else 0.0)
 
-    def multistart(self, P, phi, e, optimizer):
+    def search(self, P, phi, e, optimizer, seed=0):
         '''
-        gaiamock's multistart search for one more planet, with planets (P, phi, e) held fixed. Returns the polished
-        starts as a list of (P, phi, e, objective) for the new planet, best first.
+        gaiamock's search for one more planet (with the given optimizer), with planets (P, phi, e) held fixed. Returns
+        the results as a list of (P, phi, e, objective) for the new planet, best first: all polished starts of the
+        multistart optimizers, or the single result of annealing (which uses the C rand(), seeded with srand(seed) if
+        seed > 0, and otherwise continuing the sequence, as gaiamock does).
         '''
         P, phi, e = _nonlinear_arrays(P, phi, e)
         s = OPTIMIZER_SETTINGS[optimizer]
+        if s.get('annealing'):
+            out = np.zeros(4)
+            self.lib.gmp_anneal(*self._args(), len(P), P, phi, e, self.L, self.U, self.ecc_a, self.ecc_b, int(seed), out)
+            return [tuple(out)] if np.all(np.isfinite(out)) else []
         out, n_out = np.zeros(4*s['max_starts']), np.zeros(1, dtype=np.int32)
         self.lib.gmp_multistart(*self._args(), len(P), P, phi, e, self.L, self.U, self.ecc_a, self.ecc_b, s['n_period'], s['n_short_period'],
-                                s['n_ecc_phase'], s['max_periods_keep'], s['max_starts'], s['full_nm'], out, n_out)
+                                s['n_ecc_phase'], s['max_periods_keep'], s['max_starts'], s['full_nm'], s['n_circ_phase'], out, n_out)
         return [tuple(row) for row in out[:4*n_out[0]].reshape(-1, 4)]
 
     def polish(self, P, phi, e, free, max_iter=400, ftol=1e-6, xtol=1e-7, max_restarts=9, smooth=True):
@@ -609,13 +620,13 @@ def _dedupe(solutions, n_max):
 
 def _search_one_planet(prob, P, phi, e, settings):
     '''
-    Add one planet to the planets (P, phi, e): run gaiamock's multistart search for the new planet with the existing
-    planets held fixed, then (if there are existing planets) polish all planets jointly, starting from the best
+    Add one planet to the planets (P, phi, e): run gaiamock's search (settings['optimizer']) for the new planet with
+    the existing planets held fixed, then (if there are existing planets) polish all planets jointly, starting from the best
     settings['n_joint'] polished starts (which can share a period but differ in eccentricity or phase) and the best
     start at each of the settings['n_joint'] best distinct periods. For a single planet the best solution is exactly
     that of gaiamock's optimizer. Returns a list of solutions (P, phi, e, objective, chi2) with distinct periods, best first.
     '''
-    starts = prob.multistart(P, phi, e, settings['optimizer']) # distinct in (P, phi, e) and sorted, as in gaiamock
+    starts = prob.search(P, phi, e, settings['optimizer']) # distinct in (P, phi, e) and sorted, as in gaiamock
     sols = [(np.append(P, Pn), np.append(phi, phin), np.append(e, en), obj, None) for Pn, phin, en, obj in starts]
     best_per_period = _dedupe(sols, settings['n_joint'])
     sols = sols[:settings['n_joint']] + [s for s in best_per_period if not any(s is t for t in sols[:settings['n_joint']])]
@@ -907,8 +918,10 @@ def fit_astrometry_planets(t_ast_yr, psi, plx_factor, ast_obs, ast_err, n_planet
     binned: True (default) if each measurement is the average of 8 CCD measurements (one FOV transit), as in gaiamock.
     initial_planets: optional list of starting guesses, each a dict with keys 'period', 'Tp' (days, relative to the
         reference epoch) and 'ecc'. If given, no search is done: the planets are polished jointly from these guesses.
-    optimizer: 'periodogram_multistart' (default; gaiamock's default settings) or 'periodogram_multistart_full'
-        (gaiamock's denser grids, more starts, and tighter polish), used for each planet.
+    optimizer: gaiamock's optimizer used to search for each planet: 'periodogram_multistart' (default),
+        'periodogram_multistart_full' (denser grids, more starts, and tighter polish), 'multistart' (circular-orbit
+        grid instead of the linear periodogram; slower, with nearly identical results), or 'annealing' (adaptive
+        simulated annealing; slower, and stochastic: it uses the C rand() without reseeding, as gaiamock does).
     n_joint: with more than one planet, the number of the best (distinct) results of each planet's search that are
         polished jointly with all planets (default 3).
     refine: if True (default), after each new planet is added, re-search each planet with the others held fixed
