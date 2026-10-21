@@ -24,6 +24,7 @@ from ._data import data_dir, scan_data_available, download_scan_data, compiled_l
 #     w: argument of periastron ("little omega") of the star's reflex orbit, in radians
 #     m_planet: planet mass in Msun
 PLANET_KEYS = ('period', 'Tp', 'ecc', 'Omega', 'inc', 'w', 'm_planet')
+OPTIONAL_PLANET_KEYS = ('rv_only',) # rv_only: True for a planet without astrometric signal (see fit_astrometry_and_rv_planets())
 
 def _get_rng(rng):
     '''
@@ -48,7 +49,7 @@ def validate_planets(planets, require_Omega=True):
         if 'omega' in planet:
             raise ValueError("planet %d has key 'omega', which is ambiguous. Use 'Omega' for the longitude of the ascending node and 'w' for the argument of periastron." % i)
         missing = [k for k in required if k not in planet]
-        unknown = [k for k in planet if k not in PLANET_KEYS]
+        unknown = [k for k in planet if k not in PLANET_KEYS + OPTIONAL_PLANET_KEYS]
         if missing or unknown:
             raise ValueError('planet %d: missing keys %s, unknown keys %s. Required keys: %s' % (i, missing, unknown, list(required)))
         p = {k: float(planet[k]) for k in PLANET_KEYS if k in planet}
@@ -60,6 +61,8 @@ def validate_planets(planets, require_Omega=True):
             raise ValueError('planet %d: ecc must satisfy 0 <= ecc < 1.' % i)
         if p['m_planet'] < 0:
             raise ValueError('planet %d: m_planet must be non-negative.' % i)
+        if planet.get('rv_only'):
+            p['rv_only'] = True
         checked.append(p)
     return checked
 
@@ -249,7 +252,8 @@ def astrometry_planets_model(t_ast_yr, psi, plx_factor, ra_off, dec_off, paralla
         (ra_off includes the cos(dec) factor). These are free parameters when fitting real epoch astrometry.
     parallax (mas), pmra, pmdec (mas/yr): barycenter parallax and proper motion
     m_star: stellar mass in Msun
-    planets: list of dicts, one per planet, with keys period, Tp, ecc, Omega, inc, w, m_planet (see PLANET_KEYS)
+    planets: list of dicts, one per planet, with keys period, Tp, ecc, Omega, inc, w, m_planet (see PLANET_KEYS); a
+        planet with 'rv_only': True contributes no astrometric signal (as in fit_astrometry_and_rv_planets(rv_only=...))
     c_funcs: from read_in_C_functions() (if None, it is read in)
     jacobi: if True, use Jacobi coordinates for the planet orbits (see get_planet_a0_mas())
     return_components: if True, also return an array of shape (N_planets, N_epochs) with each planet's signal
@@ -263,6 +267,8 @@ def astrometry_planets_model(t_ast_yr, psi, plx_factor, ra_off, dec_off, paralla
     a0_mas = _reflex_a0(m_star = m_star, planets = planets, parallax = parallax, jacobi = jacobi)
     components = np.zeros((len(planets), len(t_ast_yr)))
     for i, planet in enumerate(planets):
+        if planet.get('rv_only'):
+            continue
         A, B, F, G = get_thiele_innes(a0_mas = a0_mas[i], Omega = planet['Omega'], inc = planet['inc'], w = planet['w'])
         components[i] = keplerian_al_signal(t_ast_yr = t_ast_yr, psi = psi, period = planet['period'], Tp = planet['Tp'], ecc = planet['ecc'], A = A, B = B, F = F, G = G, c_funcs = c_funcs)
 
@@ -375,8 +381,9 @@ def read_in_C_functions_plus():
     intp = np.ctypeslib.ndpointer(dtype=np.int32, flags='C_CONTIGUOUS')
     c_int, c_dbl = ctypes.c_int, ctypes.c_double
     # every function takes an astrometric dataset (n_ast, t, psi, plx_factor, obs, err, plx_mu, plx_sig, reject) and an
-    # RV dataset (n_rv, t_rv, rv, rv_err, rv_set, n_sets); either can be empty (n = 0)
-    data = [c_int, dbl, dbl, dbl, dbl, dbl, c_dbl, c_dbl, c_int, c_int, dbl, dbl, dbl, intp, c_int]
+    # RV dataset (n_rv, t_rv, rv, rv_err, rv_set, n_sets); either can be empty (n = 0); then the bit mask of the
+    # planets without astrometric signal (ast_skip)
+    data = [c_int, dbl, dbl, dbl, dbl, dbl, c_dbl, c_dbl, c_int, c_int, dbl, dbl, dbl, intp, c_int, c_int]
     lib.gmp_chi2.argtypes = data + [c_int, dbl, dbl, dbl, dbl, dbl, dbl]
     lib.gmp_periodogram.argtypes = data + [c_int, dbl, dbl, dbl, c_int, dbl, dbl]
     lib.gmp_scan.argtypes = data + [c_int, dbl, dbl, dbl, c_int, dbl, c_int, dbl, c_int, dbl]
@@ -484,6 +491,7 @@ class _Fixed:
     period, Tp, ecc (and, for joint fits, inc, Omega). A fixed Tp fixes the phase phi_p = 2 pi Tp/P, which moves with P
     if P is free. For a circular orbit (ecc fixed at 0), the phase and w are degenerate, so the phase is held fixed
     (at Tp if given, otherwise at its best-fit value); in joint fits, w then carries the orbital phase.
+    In joint fits, a planet can also be flagged rv_only (see _add_rv_only()).
     '''
     def __init__(self, per_planet):
         self.p = per_planet
@@ -494,6 +502,10 @@ class _Fixed:
 
     def phase(self, i, P):
         return 2*np.pi*np.mod(self.p[i]['Tp']/P, 1)
+
+    def rv_only(self, i):
+        '''whether planet i has no astrometric signal (it is then left out of the astrometric model)'''
+        return bool(self.p[i].get('rv_only'))
 
     def phase_fixed(self, i):
         return 'Tp' in self.p[i] or self.p[i].get('ecc') == 0.0
@@ -572,6 +584,28 @@ def _parse_fixed(fixed, n_planets, initial_planets, allowed, P_min, P_max, e_max
             raise ValueError('fixed %s must be between 0 and pi.' % key)
         per_planet[int(index)][name] = value
     return _Fixed(per_planet)
+
+def _add_rv_only(fixed, rv_only, n_planets, initial_planets):
+    '''
+    Flag the RV-only planets (indices in order of period) in the fixed parameters (a _Fixed, or None): each has no
+    astrometric signal, its Omega is fixed (it has no meaning without an astrometric orbit), and its inc is fixed at the
+    given value, or at pi/2 (flagged inc_assumed: its a0 and m_planet are then a0 sin(inc) and m_planet sin(inc)).
+    '''
+    if rv_only is None or len(rv_only) == 0:
+        return fixed
+    n = len(initial_planets) if initial_planets is not None else n_planets
+    if n is None:
+        raise ValueError('rv_only needs a known number of planets (n_planets or initial_planets).')
+    if fixed is None:
+        fixed = _Fixed([dict() for _ in range(int(n))])
+    for i in rv_only:
+        if isinstance(i, bool) or not isinstance(i, (int, np.integer)) or not 0 <= i < n:
+            raise ValueError('rv_only must be a list of planet indices in order of period (0 to %d).' % (n - 1))
+        f = fixed.p[int(i)]
+        f['rv_only'], f['Omega'] = True, 0.0
+        if 'inc' not in f:
+            f['inc'], f['inc_assumed'] = np.pi/2, True
+    return fixed
 
 def _polish_fixed(prob, P, phi, e, free_planets, max_restarts=10):
     '''
@@ -669,7 +703,8 @@ class _Problem:
 
     def _args(self):
         ast = self.data if self.data is not None else [_EMPTY_DBL]*5
-        return (self.n, *ast, self.plx_mu, self.plx_sig, self.reject, self.n_rv, self.t_rv, self.rv, self.rv_err_eff, self.rv_set, self.n_sets)
+        skip = sum(1 << i for i in range(self.fixed.n) if self.fixed.rv_only(i)) if self.fixed is not None else 0
+        return (self.n, *ast, self.plx_mu, self.plx_sig, self.reject, self.n_rv, self.t_rv, self.rv, self.rv_err_eff, self.rv_set, self.n_sets, skip)
 
     def chi2(self, P, phi, e):
         '''
@@ -1382,11 +1417,15 @@ class _JointModel:
     K [cos(nu + w) + e cos(w)] with the same w and K = 2 pi (a0/parallax) [AU] sin(inc)/(P sqrt(1 - e^2)), which needs
     no stellar mass. The systemic velocity of each RV dataset is solved analytically (weighted mean of its residuals).
     The RV errors include the jitter of the problem (prob.rv_err_eff); keep selects the astrometric epochs used.
+    rv_only: one flag per planet (default: from prob.fixed); flagged planets contribute to the RVs only.
     '''
     AU = 1.4959787e+11 # as in gaiamock.get_a0_mas()
 
-    def __init__(self, prob, c_funcs, keep, ast_scale=1.0):
+    def __init__(self, prob, c_funcs, keep, ast_scale=1.0, rv_only=None):
         self.prob, self.c_funcs, self.keep, self.ast_scale = prob, c_funcs, keep, ast_scale
+        if rv_only is None:
+            rv_only = [prob.fixed.rv_only(i) for i in range(prob.fixed.n)] if prob.fixed is not None else []
+        self.rv_only = list(rv_only)
         self.ecc_offset = _ecc_prior_offset(prob.ecc_a, prob.ecc_b) if prob.ecc_a > 0 else None
 
     def signals(self, theta):
@@ -1398,7 +1437,8 @@ class _JointModel:
         for i in range((len(theta) - 5)//7):
             P, e, phi, Omega, inc, w, a0 = theta[5 + 7*i: 12 + 7*i]
             Tp = phi*P/(2*np.pi)
-            ast = ast + keplerian_al_signal(t, psi, P, Tp, e, *get_thiele_innes(a0, Omega, inc, w), self.c_funcs)
+            if not (i < len(self.rv_only) and self.rv_only[i]):
+                ast = ast + keplerian_al_signal(t, psi, P, Tp, e, *get_thiele_innes(a0, Omega, inc, w), self.c_funcs)
             K = 2*np.pi*(a0/plx)*self.AU*np.sin(inc)/(P*86400*np.sqrt(1 - e**2))/1e3
             rv = rv + keplerian_rv_signal(self.prob.t_rv, P, Tp, e, w, K, self.c_funcs)
         return ast, rv
@@ -1462,16 +1502,22 @@ def _joint_start(prob, sol):
     '''
     Physical starting parameters from a linked solution (shared P, phi_p, e; separate astrometric Thiele-Innes and RV
     amplitudes): Campbell elements from the Thiele-Innes elements, with the (Omega, w) -> (Omega + pi, w + pi) branch
-    chosen to match the w of the RV solution.
+    chosen to match the w of the RV solution. An RV-only planet (no astrometric orbit) starts with the w of the RV
+    solution, its fixed Omega and inc, and the a0 that gives the RV solution's semi-amplitude.
     '''
     P, phi, e = sol[:3]
     _, mu_ast, worst, mu_rv = prob.chi2(P, phi, e)
     theta = [mu_ast[0], mu_ast[2], mu_ast[4], mu_ast[1], mu_ast[3]]
     S = prob.n_sets
     for i in range(len(P)):
+        w_rv = np.arctan2(mu_rv[S + 2*i + 1], mu_rv[S + 2*i])
+        if prob.fixed is not None and prob.fixed.rv_only(i):
+            inc, K = prob.fixed.p[i]['inc'], np.hypot(mu_rv[S + 2*i], mu_rv[S + 2*i + 1])
+            a0 = 1e3*K*P[i]*86400*np.sqrt(1 - e[i]**2)*abs(mu_ast[4])/(2*np.pi*_JointModel.AU*max(np.sin(inc), 1e-6))
+            theta += [P[i], e[i], phi[i], prob.fixed.p[i]['Omega'], inc, w_rv, a0]
+            continue
         B, G, A, F = mu_ast[5 + 4*i: 9 + 4*i]
         a0, Omega, w, inc = gaiamock.get_Campbell_elements(A, B, F, G)
-        w_rv = np.arctan2(mu_rv[S + 2*i + 1], mu_rv[S + 2*i])
         if abs(np.angle(np.exp(1j*(w - w_rv)))) > np.pi/2:
             Omega, w = Omega + np.pi, w + np.pi
         theta += [P[i], e[i], phi[i], Omega, inc, w, a0]
@@ -1568,6 +1614,8 @@ def _joint_fit_summary(model, theta, m_star, binned):
     order = np.argsort(theta[5::7])
     theta = np.concatenate([theta[:5]] + [theta[5 + 7*i: 12 + 7*i] for i in order])
     fixed = prob.fixed.subset(order) if prob.fixed is not None else None
+    rv_only = [fixed.rv_only(i) for i in range(n_pl)] if fixed is not None else [False]*n_pl
+    model = _JointModel(prob, model.c_funcs, model.keep, rv_only=rv_only) # for the planets in order of period
     for i in range(n_pl):
         k = 5 + 7*i
         theta[k + 2] = np.mod(theta[k + 2], 2*np.pi); theta[k + 3] = np.mod(theta[k + 3], 2*np.pi); theta[k + 5] = np.mod(theta[k + 5], 2*np.pi)
@@ -1576,12 +1624,12 @@ def _joint_fit_summary(model, theta, m_star, binned):
     chi2_ast, chi2_rv, prior = model.chi2_parts(theta)
     n_used = int(model.keep.sum())
     free_idx, T = _transform_or_identity(fixed, np.concatenate([theta, gamma]), 5, 7, _JOINT_EXTRA) # fixed parameters have no uncertainty
-    n_fixed = len(theta) + len(gamma) - len(free_idx)
-    F2, uwe, cc = _astrometric_goodness_of_fit(chi2_ast, n_used, 5 + 7*n_pl - n_fixed, binned)
+    astrometric = np.array([j < 5 or not rv_only[(j - 5)//7] for j in range(len(theta))] + [False]*len(gamma)) # parameters of the astrometric model
+    F2, uwe, cc = _astrometric_goodness_of_fit(chi2_ast, n_used, int(np.sum(astrometric[free_idx])), binned)
 
     # Jacobian of all residuals with respect to (theta, gamma), with the astrometric errors scaled by cc as in gaiamock
     full = np.concatenate([theta, gamma])
-    scaled = _JointModel(prob, model.c_funcs, model.keep, ast_scale=cc)
+    scaled = _JointModel(prob, model.c_funcs, model.keep, ast_scale=cc, rv_only=rv_only)
     def resid(x):
         return scaled.residuals(x[:len(theta)], gamma=x[len(theta):])
     J = np.zeros((len(resid(full)), len(full)))
@@ -1601,7 +1649,8 @@ def _joint_fit_summary(model, theta, m_star, binned):
     result = dict(n_planets=n_pl, minus_2_ln_like=model.minus_2_ln_like(theta), chi2=chi2_ast + chi2_rv + prior, chi2_ast=chi2_ast, chi2_rv=chi2_rv,
                   n_obs=prob.n, n_used=n_used, n_rv=prob.n_rv, F2=F2, uwe=uwe, uncertainty_scale=cc,
                   outlier_index=int(np.where(~model.keep)[0][0]) if (~model.keep).any() else -1,
-                  gamma=gamma, sig_gamma=sig[len(theta):], jitter=prob.jitter.copy(), theta=full, theta_names=names, cov=cov)
+                  gamma=gamma, sig_gamma=sig[len(theta):], jitter=prob.jitter.copy(), theta=full, theta_names=names, cov=cov,
+                  rv_only=[i for i in range(n_pl) if rv_only[i]])
     if fixed is not None:
         result['free_indices'] = free_idx
     for j, name in enumerate(names[:5]):
@@ -1631,9 +1680,13 @@ def _joint_fit_summary(model, theta, m_star, binned):
             planet[key], planet['sig_' + key] = full[5 + 7*i + j], sig[5 + 7*i + j]
         for j, key in enumerate(('Tp', 'K', 'inc_deg') + (('m_planet',) if m_star is not None else ())):
             planet[key], planet['sig_' + key] = g0[j], sig_g[j]
+        if rv_only[i]: # no astrometric orbit: Omega is undefined, and inc may be assumed (pi/2)
+            planet.update(rv_only=True, Omega=np.nan, sig_Omega=np.nan, inc_assumed=bool(fixed.p[i].get('inc_assumed')))
         planets.append(planet)
         if m_star is not None:
             model_planets.append({k: planet[k] for k in PLANET_KEYS})
+            if rv_only[i]:
+                model_planets[-1].update(Omega=0.0, rv_only=True)
     result['planets'] = planets
     result['model_planets'] = model_planets if m_star is not None else None
     return result
@@ -1642,7 +1695,7 @@ def fit_astrometry_and_rv_planets(t_ast_yr, psi, plx_factor, ast_obs, ast_err, t
                                   max_planets=3, delta_chi2_min=None, m_star=None, P_min=10., P_max=1e4, e_max=0.99, parallax_prior=None,
                                   eccentricity_prior=None, reject_outlier=False, binned=True, fit_jitter=True, jitter=None, initial_planets=None,
                                   optimizer='periodogram_multistart', n_joint=3, refine=True, n_beam=1, verbose=False, c_funcs=None, c_funcs_plus=None,
-                                  fixed=None):
+                                  fixed=None, rv_only=None):
     '''
     Fit Gaia epoch astrometry and radial velocities jointly with a model of a star hosting several planets, in two steps:
     1. A linked search, with the same search as fit_astrometry_planets() and fit_rv_planets() (gaiamock's
@@ -1671,9 +1724,17 @@ def fit_astrometry_and_rv_planets(t_ast_yr, psi, plx_factor, ast_obs, ast_err, t
         polished with these values held fixed (in the linked model, then in the exact joint fit; with inc fixed, a0 starts from the value that keeps the fitted RV semi-amplitude). Fixed parameters have zero uncertainty, and are not counted as free
         parameters. A fixed Tp fixes the phase phi_p = 2 pi Tp/P (which moves with P if P is free). For a circular
         orbit (ecc fixed at 0), the phase and w are degenerate, so the phase is held fixed (at Tp if given, otherwise
-        at its best-fit value), and w carries the orbital phase. E.g. for a transiting planet whose astrometric signal is negligible, fix inc (pi/2)
-        and Omega (which then has no measurable effect). The result then includes fixed (the dict) and free_indices (the indices of the free
+        at its best-fit value), and w carries the orbital phase. For a planet whose astrometric signal is negligible, use
+        rv_only. The result then includes fixed (the dict) and free_indices (the indices of the free
         parameters in theta); see initial_walkers() and full_theta() for MCMC sampling of the free parameters.
+    rv_only: optional list of the indices (in order of period, as for fixed) of planets without astrometric signal,
+        e.g. a planet with a large RV signal but an astrometric signal far below Gaia's precision. Such a planet is
+        left out of the astrometric model (once the planets are found: in the linked polish, then in the exact joint
+        fit) and fit to the RVs only. Its Omega is fixed (and reported as nan), and its inc is fixed at fixed['inc_<i>']
+        if given (e.g. from transits), or at pi/2 (inc_assumed), in which case its a0 and m_planet are a0 sin(inc) and
+        m_planet sin(inc). Its theta keeps the same 7 entries (P, e, phi_p, Omega, inc, w, a0), so the free parameters
+        and the MCMC tools are unchanged; pass rv_only=result['rv_only'] to log_likelihood_astrometry_and_rv_planets().
+        Needs n_planets or initial_planets.
 
     returns a dict with:
         n_planets, planets (sorted by period; each with period, ecc, phi_p, Tp, Omega, inc, inc_deg, w, a0_mas, K,
@@ -1681,8 +1742,9 @@ def fit_astrometry_and_rv_planets(t_ast_yr, psi, plx_factor, ast_obs, ast_err, t
         ra_off, dec_off, parallax, pmra, pmdec (and sig_*), gamma, sig_gamma, jitter,
         minus_2_ln_like, chi2, chi2_ast, chi2_rv, F2, uwe and uncertainty_scale (of the astrometry, as in gaiamock),
         linked_minus_2_ln_like, consistency_delta (= minus_2_ln_like - linked_minus_2_ln_like >= 0; it is large if the
-        astrometric and RV orbits disagree; roughly chi2 with 2 degrees of freedom per planet, plus one for each fixed
-        inc or Omega), chi2_history (linked -2 ln L for 0, 1, 2, ... planets), theta, theta_names,
+        astrometric and RV orbits disagree; roughly chi2 with 2 degrees of freedom per planet with an astrometric orbit,
+        plus one for each fixed inc or Omega of such a planet), chi2_history (linked -2 ln L for 0, 1, 2, ... planets),
+        rv_only (the indices of the RV-only planets; each has rv_only=True and inc_assumed in its planet dict), theta, theta_names,
         cov, model_planets, outlier_index, and in blind-search mode rejected_candidate and max_planets_searched.
     Notes: astrometric uncertainties are inflated by gaiamock's goodness-of-fit factor (uncertainty_scale); the
     uncertainty of the jitter is not propagated.
@@ -1703,6 +1765,7 @@ def fit_astrometry_and_rv_planets(t_ast_yr, psi, plx_factor, ast_obs, ast_err, t
     n_base = 5 + prob.n_sets*(2 if fit_jitter else 1)
     fixed_input = fixed
     fixed = _parse_fixed(fixed, n_planets, initial_planets, FIXABLE_PARAMETERS_JOINT, P_min, P_max, e_max)
+    fixed = _add_rv_only(fixed, rv_only, n_planets, initial_planets)
     if fixed is not None and eccentricity_prior is not None and any(f.get('ecc') == 0.0 for f in fixed.p):
         raise ValueError('an eccentricity prior cannot be combined with an eccentricity fixed at 0.')
     sol, history, rejected, n_target, blind = _fit_planets(prob, n_planets, max_planets, delta_chi2_min, initial_planets, optimizer, n_joint,
@@ -1718,7 +1781,7 @@ def fit_astrometry_and_rv_planets(t_ast_yr, psi, plx_factor, ast_obs, ast_err, t
     result['chi2_history'] = history
     result['fit_jitter'] = bool(fit_jitter)
     if fixed is not None:
-        result['fixed'] = dict(fixed_input)
+        result['fixed'] = dict(fixed_input or {})
     if blind:
         result['rejected_candidate'] = rejected
         result['max_planets_searched'] = n_target
@@ -1829,7 +1892,7 @@ def log_likelihood_rv_planets(theta, t_rvs_yr, rv, rv_err, rv_dataset=None, jitt
     return lnL if np.isfinite(lnL) else -np.inf
 
 def log_likelihood_astrometry_and_rv_planets(theta, t_ast_yr, psi, plx_factor, ast_obs, ast_err, t_rvs_yr, rv, rv_err, rv_dataset=None,
-                                             jitter=None, reject_outlier=False, fit_ast_jitter=False, c_funcs=None, c_funcs_plus=None):
+                                             jitter=None, reject_outlier=False, fit_ast_jitter=False, c_funcs=None, c_funcs_plus=None, rv_only=None):
     '''
     ln L of epoch astrometry and RVs for N planets (no priors): the sum of log_likelihood_astrometry_planets() and
     log_likelihood_rv_planets() for the same orbits, with theta ordered as the 'theta' of
@@ -1839,6 +1902,8 @@ def log_likelihood_astrometry_and_rv_planets(theta, t_ast_yr, psi, plx_factor, a
     astrometry_and_rv_planets_model() (K follows from a0, parallax, inc, P and e). N is set by the length of theta.
     fit_ast_jitter: if True, the last entry of theta (after the RV jitters) is an astrometric jitter, as in
         log_likelihood_astrometry_planets().
+    rv_only: indices of the planets without astrometric signal (as in the fit: fit_result['rv_only']); their Omega
+        is ignored, and they enter the RVs only.
     '''
     t, rv, rv_err, sets, n_sets = _rv_data(t_rvs_yr, rv, rv_err, rv_dataset)
     theta = np.asarray(theta, dtype=np.float64)
@@ -1856,7 +1921,8 @@ def log_likelihood_astrometry_and_rv_planets(theta, t_ast_yr, psi, plx_factor, a
         return -np.inf
     prob = _Problem(ast=(t_ast_yr, psi, plx_factor, ast_obs, ast_err), rv=(t, rv, rv_err, sets), c_funcs_plus=c_funcs_plus)
     prob.set_jitter(jit)
-    resid = _JointModel(prob, _get_c_funcs(c_funcs), np.ones(prob.n, dtype=bool)).residuals(phys, gamma=gamma)
+    flags = [i in set(rv_only or ()) for i in range(n_pl)]
+    resid = _JointModel(prob, _get_c_funcs(c_funcs), np.ones(prob.n, dtype=bool), rv_only=flags).residuals(phys, gamma=gamma)
     lnL = _ast_log_like(resid[:prob.n], reject_outlier, prob.data[4], ast_jitter) + _rv_log_like(resid[prob.n:prob.n + prob.n_rv], prob.rv_err_eff)
     return lnL if np.isfinite(lnL) else -np.inf
 
@@ -1868,9 +1934,10 @@ def estimate_astrometric_jitter(fit_result, ast_err):
     epoch uncertainties used in the fit.
     '''
     if 'chi2_ast' in fit_result: # joint fit: the astrometric chi2 and the number of free astrometric parameters
-        n_ast_par = 5 + 7*fit_result['n_planets']
-        if fit_result.get('free_indices') is not None:
-            n_ast_par = int(np.sum(np.asarray(fit_result['free_indices']) < n_ast_par))
+        rv_only = set(fit_result.get('rv_only', ()))
+        astrometric = {j for j in range(5 + 7*fit_result['n_planets']) if j < 5 or (j - 5)//7 not in rv_only}
+        free = fit_result.get('free_indices')
+        n_ast_par = len(astrometric) if free is None else len(astrometric & {int(k) for k in free})
         chi2, nu = fit_result['chi2_ast'], fit_result['n_used'] - n_ast_par
     else:
         chi2, nu = fit_result['chi2_data'], fit_result['nu']

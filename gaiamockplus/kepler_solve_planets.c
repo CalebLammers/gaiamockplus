@@ -21,7 +21,10 @@ Options shared by most functions:
         linear solution is recomputed without it (the same "drop-one" objective as gaiamock's reject_outlier option)
     rv_set, n_sets: the RV dataset (0 to n_sets - 1) of each RV, and the number of RV datasets; rv_err should include
         any jitter, added in quadrature
-    ecc_a, ecc_b: Beta(ecc_a, ecc_b) prior on each eccentricity; none if ecc_a <= 0 or ecc_b <= 0 */
+    ecc_a, ecc_b: Beta(ecc_a, ecc_b) prior on each eccentricity; none if ecc_a <= 0 or ecc_b <= 0
+    ast_skip: bit mask of the planets (bit i for planet i) with no astrometric signal ("RV-only" planets, e.g. a planet
+        whose astrometric signal is negligible): they have no astrometric columns (their B, G, A, F are returned as
+        0), and enter the RVs only. Search functions never skip the new planet. */
 
 #include <math.h>
 #include <stdlib.h>
@@ -91,12 +94,22 @@ typedef struct {
     int reject;              /* drop the worst epoch (astrometry only) */
     const int *set;          /* RV dataset index of each epoch (RVs only) */
     int n_sets, n_base, n_pp;
+    int skip;                /* bit mask of the planets with no columns (astrometry only; see ast_skip) */
 } gmp_data;
 
-#define GMP_COL(d, i) ((d)->n_base + (d)->n_pp*(i)) /* first column of planet i */
+static int gmp_skipped(const gmp_data *d, int i){
+    return (d->skip >> i) & 1;
+}
+
+/* first column of planet i (also the number of columns of planets 0 to i - 1, after the base columns) */
+static int gmp_col(const gmp_data *d, int i){
+    int c = d->n_base;
+    for (int j = 0; j < i; j++) if (!gmp_skipped(d, j)) c += d->n_pp;
+    return c;
+}
 
 static int gmp_data_init(gmp_data *d, int n, const double *t, const double *psi, const double *plx, const double *obs, const double *err, double plx_mu, double plx_sig, int reject){
-    d->type = GMP_AST; d->n_base = 5; d->n_pp = 4; d->set = NULL; d->n_sets = 0;
+    d->type = GMP_AST; d->n_base = 5; d->n_pp = 4; d->set = NULL; d->n_sets = 0; d->skip = 0;
     d->n = n; d->t = t; d->plx = plx; d->obs = obs;
     d->plx_mu = plx_mu; d->plx_sig = plx_sig; d->reject = reject;
     d->spsi = (double*)malloc(3*(size_t)n*sizeof(double));
@@ -112,7 +125,7 @@ static int gmp_data_init(gmp_data *d, int n, const double *t, const double *psi,
 }
 
 static int gmp_data_init_rv(gmp_data *d, int n, const double *t, const double *rv, const double *rv_err, const int *set, int n_sets){
-    d->type = GMP_RV; d->n_base = n_sets; d->n_pp = 2; d->set = set; d->n_sets = n_sets;
+    d->type = GMP_RV; d->n_base = n_sets; d->n_pp = 2; d->set = set; d->n_sets = n_sets; d->skip = 0;
     d->n = n; d->t = t; d->plx = NULL; d->obs = rv;
     d->plx_mu = 0.0; d->plx_sig = -1.0; d->reject = 0;
     d->spsi = (double*)malloc((size_t)n*sizeof(double));
@@ -314,8 +327,8 @@ typedef struct {
 
 #define GMP_DATA_ARGS int n_ast, const double *t, const double *psi, const double *plx, const double *obs, const double *err, \
                       double plx_mu, double plx_sig, int reject, \
-                      int n_rv, const double *t_rv, const double *rv, const double *rv_err, const int *rv_set, int n_sets
-#define GMP_DATA_PASS n_ast, t, psi, plx, obs, err, plx_mu, plx_sig, reject, n_rv, t_rv, rv, rv_err, rv_set, n_sets
+                      int n_rv, const double *t_rv, const double *rv, const double *rv_err, const int *rv_set, int n_sets, int ast_skip
+#define GMP_DATA_PASS n_ast, t, psi, plx, obs, err, plx_mu, plx_sig, reject, n_rv, t_rv, rv, rv_err, rv_set, n_sets, ast_skip
 
 static void gmp_problem_free(gmp_problem *pr){
     for (int k = 0; k < pr->nd; k++){
@@ -331,6 +344,7 @@ static int gmp_problem_init(gmp_problem *pr, GMP_DATA_ARGS, int n_pl){
     if (n_pl < 0 || n_pl > GMP_MAX_PLANETS || n_sets > GMP_MAX_SETS) return 1;
     if (n_ast > 0){
         if (gmp_data_init(&pr->d[pr->nd], n_ast, t, psi, plx, obs, err, plx_mu, plx_sig, reject)) return 1;
+        pr->d[pr->nd].skip = ast_skip;
         pr->A[pr->nd] = NULL;
         pr->nd++;
     }
@@ -350,11 +364,18 @@ static int gmp_problem_init(gmp_problem *pr, GMP_DATA_ARGS, int n_pl){
 }
 
 static void gmp_problem_fill_planet(gmp_problem *pr, int i, double P, double phi, double e){
-    for (int k = 0; k < pr->nd; k++) gmp_fill_planet_columns(&pr->d[k], pr->A[k], GMP_COL(&pr->d[k], i), P, phi, e);
+    for (int k = 0; k < pr->nd; k++)
+        if (!gmp_skipped(&pr->d[k], i)) gmp_fill_planet_columns(&pr->d[k], pr->A[k], gmp_col(&pr->d[k], i), P, phi, e);
 }
 
 static void gmp_problem_fill_circular(gmp_problem *pr, int i, double P){
-    for (int k = 0; k < pr->nd; k++) gmp_fill_circular_columns(&pr->d[k], pr->A[k], GMP_COL(&pr->d[k], i), P);
+    for (int k = 0; k < pr->nd; k++)
+        if (!gmp_skipped(&pr->d[k], i)) gmp_fill_circular_columns(&pr->d[k], pr->A[k], gmp_col(&pr->d[k], i), P);
+}
+
+/* the new planet of a search (index i) is never skipped */
+static void gmp_problem_unskip(gmp_problem *pr, int i){
+    for (int k = 0; k < pr->nd; k++) pr->d[k].skip &= ~(1 << i);
 }
 
 /* Solve the linear parameters of each dataset for n_pl planets. parts (if not NULL) receives the astrometric chi2,
@@ -366,14 +387,19 @@ static double gmp_problem_solve(gmp_problem *pr, int n_pl, double *parts, int *w
     if (worst != NULL) *worst = -1;
     for (int k = 0; k < pr->nd; k++){
         gmp_data *d = &pr->d[k];
-        int p = d->n_base + d->n_pp*n_pl, w;
+        int p = gmp_col(d, n_pl), w;
         double prior;
         double chi2 = gmp_linear_solve(d, p, pr->A[k], mu, &prior, &w);
         total += chi2 + prior;
         if (d->type == GMP_AST){
             if (parts != NULL) { parts[0] = chi2; parts[1] = prior; }
             if (worst != NULL) *worst = w;
-            if (mu_ast != NULL) memcpy(mu_ast, mu, p*sizeof(double));
+            if (mu_ast != NULL){ /* 5 + 4 n_pl values, with zeros for skipped planets */
+                memcpy(mu_ast, mu, d->n_base*sizeof(double));
+                for (int i = 0; i < n_pl; i++)
+                    for (int c = 0; c < d->n_pp; c++)
+                        mu_ast[d->n_base + d->n_pp*i + c] = gmp_skipped(d, i) ? 0.0 : mu[gmp_col(d, i) + c];
+            }
         } else {
             if (parts != NULL) parts[2] = chi2;
             if (mu_rv != NULL) memcpy(mu_rv, mu, p*sizeof(double));
@@ -408,6 +434,7 @@ void gmp_periodogram(GMP_DATA_ARGS, int n_fixed, const double *P, const double *
     for (int k = 0; k < n_trial; k++) chi2_out[k] = NAN;
     gmp_problem pr;
     if (gmp_problem_init(&pr, GMP_DATA_PASS, n_fixed + 1)) return;
+    gmp_problem_unskip(&pr, n_fixed);
     for (int i = 0; i < n_fixed; i++) gmp_problem_fill_planet(&pr, i, P[i], phi[i], e[i]);
     for (int k = 0; k < n_trial; k++){
         gmp_problem_fill_circular(&pr, n_fixed, trial_P[k]);
@@ -425,6 +452,7 @@ void gmp_scan(GMP_DATA_ARGS, int n_fixed, const double *P, const double *phi, co
     for (int k = 0; k < n_cand*n_ecc*n_phase; k++) chi2_out[k] = NAN;
     gmp_problem pr;
     if (gmp_problem_init(&pr, GMP_DATA_PASS, n_fixed + 1)) return;
+    gmp_problem_unskip(&pr, n_fixed);
     for (int i = 0; i < n_fixed; i++) gmp_problem_fill_planet(&pr, i, P[i], phi[i], e[i]);
     for (int ic = 0; ic < n_cand; ic++){
         for (int ie = 0; ie < n_ecc; ie++){
@@ -727,6 +755,7 @@ void gmp_multistart(GMP_DATA_ARGS, int n_fixed, const double *P, const double *p
     *n_out = 0;
     gmp_problem pr;
     if (gmp_problem_init(&pr, GMP_DATA_PASS, n_fixed + 1)) return;
+    gmp_problem_unskip(&pr, n_fixed);
     int n_pl = n_fixed + 1;
     int max_periods = 32, max_candidates = 256;
     double ecc_grid[6] = {0.0, 0.2, 0.4, 0.6, 0.8, 0.95};
@@ -862,6 +891,7 @@ void gmp_anneal(GMP_DATA_ARGS, int n_fixed, const double *P, const double *phi, 
     out[0] = out[1] = out[2] = out[3] = NAN;
     gmp_problem pr;
     if (gmp_problem_init(&pr, GMP_DATA_PASS, n_fixed + 1)) return;
+    gmp_problem_unskip(&pr, n_fixed);
     if (seed > 0) srand(seed);
     int n_pl = n_fixed + 1;
     double Pall[GMP_MAX_PLANETS], phiall[GMP_MAX_PLANETS], eall[GMP_MAX_PLANETS];
