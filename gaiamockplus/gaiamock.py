@@ -3,6 +3,7 @@ import matplotlib.pyplot as plt
 import os 
 import ctypes 
 from astropy.table import Table
+from ._data import compiled_library, data_dir, scan_data_dir # gaiamockplus: file locations in the installed package
 import healpy as hp
 import joblib
 
@@ -20,16 +21,7 @@ def read_in_C_functions():
     '''
     this function reads in compiled functions from kepler_solve_astrometry.so 
     '''
-    script_dir = os.path.dirname(__file__)
-    compiled_path = os.path.join(script_dir, 'kepler_solve_astrometry.so')
-    multistart_compiled_path = os.path.join(script_dir, 'kepler_solve_astrometry_multistart.so')
-    if os.path.exists(compiled_path):
-        c_funcs = ctypes.CDLL(compiled_path)
-    elif os.path.exists(multistart_compiled_path):
-        c_funcs = ctypes.CDLL(multistart_compiled_path)
-    else:
-        raise ValueError('You need to compile kepler_solve_astrometry.c!')
-    return c_funcs
+    return ctypes.CDLL(compiled_library('kepler_solve_astrometry')) # gaiamockplus: compiled when the package is installed
     
 def get_astrometric_chi2(t_ast_yr, psi, plx_factor, ast_obs, ast_err, P, phi_p, ecc, c_funcs, reject_outlier=False, 
     parallax_priors = (None, -1)):
@@ -744,7 +736,7 @@ def get_realistic_epoch_astrometry_errors(ra, dec, phot_g_mean_mag):
     
     hpxs =  hp.ang2pix(16, np.radians(90.0 - np.array(dec)), np.radians(np.array(ra)), nest=False)
    
-    tmp = np.load(os.path.join(os.path.dirname(__file__), 'healpix_16_med_ruwe.npz'))
+    tmp = np.load(os.path.join(data_dir(), 'healpix_16_med_ruwe.npz')) # gaiamockplus: optional file, kept in the data folder
     med_ruwe = tmp['med_ruwe']
     tmp.close()
     
@@ -799,12 +791,12 @@ def fetch_table_element(colname, table):
 
 def get_gost_one_position(ra, dec, data_release):
     '''
-    this function finds the scan times and angles for a given sky position and data release by searching for the nearest position in a pre-downloaded set of 49152 sky positions (healpix level 64). For this to work, you need to have downloaded healpix_scans.zip and unzipped it into gaiamock/healpix_scans. 
+    this function finds the scan times and angles for a given sky position and data release by searching for the nearest position in a pre-downloaded set of 49152 sky positions (healpix level 64). (gaiamockplus: these data, healpix_scans.zip, are downloaded automatically the first time they are needed; see gaiamockplus.download_scan_data().) 
     ra and dec: coordinates of interest in degrees (floats)
     data_release: 'dr3', 'dr4', or 'dr5'
     '''
     num =  hp.ang2pix(64, np.radians(90.0 - np.array(dec)), np.radians(np.array(ra)), nest=False)
-    tab = Table.read(os.path.join(os.path.dirname(__file__), 'healpix_scans/healpix_64_%d.fits' % num))
+    tab = Table.read(os.path.join(scan_data_dir(), 'healpix_64_%d.fits' % num)) # gaiamockplus: downloaded once, when first needed
     jd = fetch_table_element('ObservationTimeAtBarycentre[BarycentricJulianDateInTCB]', tab)
     
     if data_release == 'dr4':

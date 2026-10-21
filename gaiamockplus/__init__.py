@@ -9,11 +9,11 @@ Conventions follow gaiamock: times in days (Tp relative to the reference epoch o
 radians, masses in Msun, astrometry in mas. Thiele-Innes elements describe the photocenter (here, the host star's
 reflex) orbit, so w is the argument of periastron of the star's orbit, which differs by pi from that of the planet.
 '''
-import os
 import ctypes
 import numpy as np
-import gaiamock
-from gaiamock import *
+from . import gaiamock
+from .gaiamock import *
+from ._data import data_dir, scan_data_available, download_scan_data, compiled_library
 
 # Each planet is a dict with exactly these keys:
 #     period: orbital period in days
@@ -66,7 +66,8 @@ def validate_planets(planets, require_Omega=True):
 def get_scan_metadata(ra, dec, data_release, reject_10_percent=True, rng=None):
     '''
     Get the Gaia scan times, scan angles, and parallax factors for a sky position, as used by all of the
-    predict_astrometry_* functions. Requires the healpix_scans/ directory (see README).
+    predict_astrometry_* functions. Uses the scanning-law data (healpix_scans/), which are downloaded automatically
+    the first time they are needed (see download_scan_data()).
     ra, dec: coordinates in degrees
     data_release: 'dr3', 'dr4', or 'dr5'
     reject_10_percent: if True, randomly drop ~10% of FOV transits, as in gaiamock
@@ -354,13 +355,10 @@ MAX_RV_DATASETS = 20 # must match GMP_MAX_SETS in kepler_solve_planets.c
 
 def read_in_C_functions_plus():
     '''
-    Read in the compiled functions from kepler_solve_planets.so (compile kepler_solve_planets.c first; see the top of that file).
+    Read in the compiled functions from kepler_solve_planets.c (compiled when the package is installed).
     These are separate from gaiamock's read_in_C_functions().
     '''
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'kepler_solve_planets.so')
-    if not os.path.exists(path):
-        raise ValueError('You need to compile kepler_solve_planets.c! (see the top of that file)')
-    lib = ctypes.CDLL(path)
+    lib = ctypes.CDLL(compiled_library('kepler_solve_planets'))
     dbl = np.ctypeslib.ndpointer(dtype=np.float64, flags='C_CONTIGUOUS')
     intp = np.ctypeslib.ndpointer(dtype=np.int32, flags='C_CONTIGUOUS')
     c_int, c_dbl = ctypes.c_int, ctypes.c_double
@@ -921,7 +919,9 @@ def fit_astrometry_planets(t_ast_yr, psi, plx_factor, ast_obs, ast_err, n_planet
     optimizer: gaiamock's optimizer used to search for each planet: 'periodogram_multistart' (default),
         'periodogram_multistart_full' (denser grids, more starts, and tighter polish), 'multistart' (circular-orbit
         grid instead of the linear periodogram; slower, with nearly identical results), or 'annealing' (adaptive
-        simulated annealing; slower, and stochastic: it uses the C rand() without reseeding, as gaiamock does).
+        simulated annealing; slower, and stochastic: it uses the C rand() without reseeding, as gaiamock does). A single
+        annealing run per planet is less reliable than the multistart optimizers: in our tests it occasionally missed a
+        planet in joint astrometry + RV fits, whose objective is very sharply peaked.
     n_joint: with more than one planet, the number of the best (distinct) results of each planet's search that are
         polished jointly with all planets (default 3).
     refine: if True (default), after each new planet is added, re-search each planet with the others held fixed

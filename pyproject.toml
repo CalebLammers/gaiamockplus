@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gaiamockplus"
+version = "0.1.0"
+description = "Gaia epoch astrometry simulations (gaiamock) extended to N-planet systems: models, RVs, and fitting"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Caleb Lammers" }, { name = "Kareem El-Badry" }]
+requires-python = ">=3.9"
+dependencies = ["numpy", "scipy", "astropy", "healpy", "joblib", "matplotlib"]
+
+[project.optional-dependencies]
+dust = ["mwdust"]
+test = ["pytest"]
+
+[project.urls]
+Homepage = "https://github.com/CalebLammers/gaiamockplus"
+"Original gaiamock" = "https://github.com/kareemelbadry/gaiamock"
+
+[tool.setuptools]
+packages = ["gaiamockplus"]
+include-package-data = false # the wheel needs only the modules and the compiled libraries
