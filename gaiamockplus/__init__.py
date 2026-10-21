@@ -191,6 +191,18 @@ def get_planet_K_kms(m_star, planets, jacobi=False):
     planets = validate_planets(planets, require_Omega=False)
     return _K_kms(m_star = m_star, planets = planets, jacobi = jacobi)
 
+def get_planet_m_sini(K_kms, period, ecc, m_star):
+    '''
+    Calculate the minimum mass m_planet sin(inc) (in Msun) of a planet from the semi-amplitude of the star's radial
+    velocity: the exact inverse of get_planet_K_kms() for inc = pi/2 (a two-body orbit around the star).
+    K_kms: RV semi-amplitude in km/s; period: in days; ecc: eccentricity; m_star: stellar mass in Msun
+    All inputs can be scalars or numpy arrays (broadcast together), e.g. MCMC samples.
+    '''
+    AU = 1.4959787e+11 # same constant as gaiamock.get_a0_mas()
+    K_kms, period, ecc = np.asarray(K_kms, dtype=float), np.asarray(period, dtype=float), np.asarray(ecc, dtype=float)
+    a_sini_au = K_kms*1e3*period*86400*np.sqrt(1 - ecc**2)/(2*np.pi*AU) # the star's a sin(inc), in AU
+    return get_dark_companion_mass(a0_mas=a_sini_au, period=period, parallax=1.0, m1=m_star) # with parallax = 1 mas, mas = AU
+
 def keplerian_rv_signal(t_rvs_yr, period, Tp, ecc, w, K, c_funcs):
     '''
     Radial velocity of the star due to one Keplerian orbit: K [cos(nu + w) + ecc cos(w)], with positive values
@@ -1007,17 +1019,15 @@ def _derived_rv_quantities(theta, cov, i, n_sets, m_star):
     Tp, K, w (and m sin i if m_star is given) of planet i, and their uncertainties propagated from the covariance
     matrix of theta (gamma per RV dataset, then P, e, phi_p, K cos(w), K sin(w) per planet) with a central-difference
     Jacobian. Differences of w (defined modulo 2 pi) are wrapped. m sin(i) is the companion mass for sin(i) = 1,
-    computed exactly as the inverse of get_planet_K_kms() with inc = pi/2.
+    computed exactly as the inverse of get_planet_K_kms() with inc = pi/2 (get_planet_m_sini()).
     '''
-    AU = 1.4959787e+11 # as in gaiamock.get_a0_mas()
     sig = np.sqrt(np.abs(np.diag(cov)))
     def derived(th):
         Pi, ei, phii, h, c = th[n_sets + 5*i: n_sets + 5*i + 5]
         K = np.hypot(h, c)
         out = [phii*Pi/(2*np.pi), K, np.mod(np.arctan2(c, h), 2*np.pi)]
-        if m_star is not None: # a_star sin(i) in AU, then the companion mass for sin(i) = 1
-            a_sini_au = K*1e3*Pi*86400*np.sqrt(1 - ei**2)/(2*np.pi*AU)
-            out.append(get_dark_companion_mass(a0_mas=a_sini_au, period=Pi, parallax=1.0, m1=m_star))
+        if m_star is not None:
+            out.append(get_planet_m_sini(K, Pi, ei, m_star))
         return np.array(out)
     g0 = derived(theta)
     Jg = np.zeros((len(g0), len(theta)))
