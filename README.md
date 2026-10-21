@@ -22,7 +22,7 @@ This compiles the package's C code, which needs a C compiler and the [GSL](https
 
 The first time Gaia's scanning law is needed, gaiamockplus downloads it automatically to `~/.gaiamockplus` (984 MB unzipped). To use an existing copy of gaiamock's `healpix_scans/` folder instead, set the environment variable `GAIAMOCKPLUS_DATA` to the folder that contains it.
 
-The example notebooks also need `emcee` and `corner` (`pip install emcee corner`).
+The example notebooks also need `emcee` and `corner`, and notebook 07 needs `dynesty` (`pip install emcee corner dynesty`).
 
 ## Examples
 
@@ -32,6 +32,7 @@ The example notebooks also need `emcee` and `corner` (`pip install emcee corner`
 - [04_two_planet_astrometry_and_rvs](notebooks/04_two_planet_astrometry_and_rvs.ipynb): two planets with astrometry and RVs, and their mutual inclination.
 - [05_transiting_planet_and_astrometric_giant](notebooks/05_transiting_planet_and_astrometric_giant.ipynb): a transiting planet, an astrometric giant, and their minimum mutual inclination.
 - [06_gaia4b_dr4_astrometry_and_rvs](notebooks/06_gaia4b_dr4_astrometry_and_rvs.ipynb): a joint fit of Gaia-4's RV datasets and pre-release epoch astrometry.
+- [07_nested_sampling_astrometry_and_rvs](notebooks/07_nested_sampling_astrometry_and_rvs.ipynb): joint fit of RVs and astrometry with nested sampling (dynesty).
 
 ## Contact
 
