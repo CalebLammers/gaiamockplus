@@ -1,52 +1,35 @@
-# gaiamock
+# gaiamockplus
 
-This is a package for simulating Gaia astrometry at the epoch level. To install it, do the following: 
+**gaiamockplus** extends [gaiamock](https://github.com/kareemelbadry/gaiamock), a fast forward model of Gaia epoch astrometry, to stars hosting any number of planets (or other dark companions). It can:
 
-(0) Install the required packages: numpy, matplotlib, os, ctypes, healpy, and joblib. In my experience these are usually relatively painless to install via pip. If you want to simulate sources distributed throughout the Galaxy with dust, you also need to install [mwdust](https://github.com/jobovy/mwdust), which is also available via pip. 
+- simulate Gaia epoch astrometry (and RVs) of N-planet systems;
+- fit them: astrometry, RVs from multiple instruments, or both jointly, searching for planets with C-based optimizers for a known number of planets or blindly;
+- provide likelihoods and starting points for MCMC samplers.
 
-(1) clone this repository (click the green "code" button in the upper right of this page).
+All of gaiamock is included (`from gaiamockplus import gaiamock`). If you use gaiamockplus, please cite [El-Badry et al. (2024)](https://arxiv.org/abs/2411.00088).
 
-(2) download the file healpix_scans.zip from [this](https://caltech.box.com/s/4f7q6qdh0bku881bzvzxc4cm5u0902cf) link.
-Unzip it inside gaiamock/ so that you have a directory gaiamock/healpix_scans/. That directory should have 49152 fits files inside it. The total size after unzipping will be 984 MB. 
+![Best-fit photocenter orbit and along-scan angle residuals for a simulated single-planet system](figures/example_fit.png)
+*Simulated Gaia DR5 astrometry of a star with an 8 Jupiter-mass planet ([notebook 01](notebooks/01_single_planet_astrometry.ipynb)): the best-fit photocenter orbit (left), and the along-scan residuals of the best-fit models without and with the planet (right).*
 
-(3) If you don't already have it installed, install [GSL](https://www.gnu.org/software/gsl/). On a Mac, this is likely most easily accomplished via Homebrew. 
+## Installation
 
-(4) Inside the gaiamock/ directory, compile the file kepler_solve_astrometry.c. This will require linking GSL. The exact command will depend on where you installed GSL and on your compiler. On my Macbook, the command to compile was: 
-
-gcc -shared -o kepler_solve_astrometry.so kepler_solve_astrometry.c -I/opt/homebrew/Cellar/gsl/2.7.1/include  -L/opt/homebrew/Cellar/gsl/2.7.1/lib -lgsl -lgslcblas -lm 
-
-On my local cluster (where GSL is already linked by default), the command to compile was:
-
-gcc -shared -o kepler_solve_astrometry.so kepler_solve_astrometry.c -lgsl -lgslcblas -lm -fPIC 
-
-If everything works, this will create a compiled file gaiamock/kepler_solve_astrometry.so. If it didn't work, there is probably a problem with the linking of your GSL installation.
-
-(5) You are ready to go! Some basic functionality is demonstrated in the demo.ipynb notebook. 
-
-A simple bash submission script to run on a cluster is provided in example_bash_submission.py. That reproduces Fig 13 of the paper. 
-
-This code is regularly updated and includes functionality beyond what is shown in the demo. If you have questions, or if you spot a bug, please contact me at kelbadry@caltech.edu. 
-
-# A modified version to predict RUWE more reliably for small orbits and single stars
-
-The default version of gaiamock does a pretty good job of predicting RUWE for binaries with "large" photocenter orbits -- see e.g. Figure 1 of [this](https://arxiv.org/abs/2504.11528) paper. However, it doesn't accurately predict the RUWE distribution of single stars or binaries with barely-detectable orbital motion: it predicts a RUWE distribution that is narrower than observed. There are at least two reason for this: 
-
-(a) The default gaiamock bins (i.e. averages) the 8-9 measurements from individual CCDs during a single FOV transit for computational speed. This reduces the variance in the predicted RUWE due to shot noise.
-
-(b) The observed Gaia data (at least in DR3) displays systematic trends in the median RUWE with sky position, likely in part due to crowding (e.g. the median RUWE for bright stars is lowest near the Galactic center). The origin of these trends is not well understood.
-
-A modified version of gaiamock is available to improve the reliability of RUWE predictions. It does away with binning (and therefore is slower by a factor of a few, but still fast enough for most applications), and implements an empirical position-dependent rescaling of the epoch-level astrometric uncertainties. This is probably not the optimal way to model RUWE, but it is significantly more reliable than the default version of the code. 
-
-To use the modified version of gaiamock, do the following: 
-
-(1) From [this](https://caltech.box.com/s/lnszhrytqjt4f28l6eoyghsxrs7vg25n) link, download the individual_ccds.zip file and unzip the contents into the healpix_scans/ directory of gaiamock. You can leave the other files that are already there.
-
-(2) Download the healpix_16_med_ruwe.npz file and put it in your gaiamock/ directory.
-
-(3) Download the gaiamock_mod.py file and put it in your gaiamock/ directory.
-
-Now you can 
+```bash
+pip install git+https://github.com/CalebLammers/gaiamockplus.git
 ```
-import gaiamock_mod as gaiamock
-```
-and use the same functions you would use in gaiamock, e.g. for predicting epoch astrometry and computing RUWE. 
+
+This compiles the package's C code, which needs a C compiler and the [GSL](https://www.gnu.org/software/gsl/) library (e.g. `brew install gsl` on macOS, or `sudo apt install libgsl-dev` on Debian/Ubuntu). macOS and Linux are supported. For development, clone the repository and run `pip install -e .`.
+
+The first time Gaia's scanning law is needed, gaiamockplus downloads it (286 MB; 984 MB unzipped) to `~/.gaiamockplus`. To use an existing copy of gaiamock's `healpix_scans/` folder instead, set the environment variable `GAIAMOCKPLUS_DATA` to the folder that contains it.
+
+The example notebooks also need `emcee` and `corner` (`pip install emcee corner`).
+
+## Examples
+
+- [01_single_planet_astrometry](notebooks/01_single_planet_astrometry.ipynb): simulate and fit the astrometry of a single-planet system, and sample the posterior with MCMC.
+- [02_two_planet_astrometry](notebooks/02_two_planet_astrometry.ipynb): a blind search for astrometric planets in a two-planet system.
+- [03_single_planet_astrometry_and_rvs](notebooks/03_single_planet_astrometry_and_rvs.ipynb): RVs from three instruments, fit alone and jointly with the astrometry.
+- [04_two_planet_astrometry_and_rvs](notebooks/04_two_planet_astrometry_and_rvs.ipynb): two planets with astrometry and RVs, and their mutual inclination.
+
+## Contact
+
+Questions/requests can be sent to caleb [dot] lammers [at] princeton [dot] edu.
