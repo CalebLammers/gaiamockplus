@@ -1759,33 +1759,54 @@ def _split_jitter(theta, n_sets, jitter):
         return theta[:-n_sets], theta[-n_sets:]
     return theta, np.broadcast_to(np.asarray(jitter, dtype=np.float64), (n_sets,))
 
-def _ast_log_like(resid, reject_outlier):
-    '''-chi2/2 from normalized astrometric residuals; with reject_outlier, the largest residual is ignored (as in gaiamock).'''
-    chi2 = np.sum(resid**2)
+def _ast_log_like(resid, reject_outlier, ast_err=None, ast_jitter=None):
+    '''
+    -chi2/2 from normalized astrometric residuals; with reject_outlier, the largest residual is ignored (as in gaiamock).
+    With an astrometric jitter (mas; ast_err the reported uncertainties), each epoch's uncertainty is
+    sqrt(ast_err^2 + jitter^2), and ln L = -(chi2 + sum of ln(2 pi sigma^2))/2, as for the RVs.
+    '''
+    if ast_jitter is None:
+        chi2 = np.sum(resid**2)
+        if reject_outlier and len(resid) > 0:
+            chi2 -= np.max(resid**2)
+        return -0.5*chi2
+    var = ast_err**2 + ast_jitter**2
+    z2 = (resid*ast_err)**2/var
+    terms = z2 + np.log(2*np.pi*var)
     if reject_outlier and len(resid) > 0:
-        chi2 -= np.max(resid**2)
-    return -0.5*chi2
+        terms = np.delete(terms, np.argmax(z2))
+    return -0.5*np.sum(terms)
 
 def _rv_log_like(resid, sig):
     '''-(chi2 + sum of ln(2 pi sigma^2))/2: the same convention as the minus_2_ln_like of the RV and joint fits.'''
     return -0.5*(np.sum(resid**2) + np.sum(np.log(2*np.pi*sig**2)))
 
-def log_likelihood_astrometry_planets(theta, t_ast_yr, psi, plx_factor, ast_obs, ast_err, reject_outlier=False, c_funcs_plus=None):
+def log_likelihood_astrometry_planets(theta, t_ast_yr, psi, plx_factor, ast_obs, ast_err, reject_outlier=False, fit_ast_jitter=False,
+                                      c_funcs_plus=None):
     '''
     ln L = -chi2/2 of epoch astrometry for N planets (no priors), with theta ordered as the 'theta' of
     fit_astrometry_planets(): (ra_off, dec_off, parallax, pmra, pmdec, then for each planet: period, ecc, phi_p, A,
     B, F, G), in the units of gaiamock (mas, mas/yr, days, radians). For one planet this is gaiamock's 12-parameter
     solution (as in gaiamock.mcmc_fit_with_thiele_innes_elements()). N is set by the length of theta.
     reject_outlier: if True, the epoch with the largest residual is ignored, as in gaiamock.
+    fit_ast_jitter: if True, the last entry of theta is an astrometric jitter s (mas, >= 0), added in quadrature to
+        ast_err: unmodeled noise, which real Gaia epoch astrometry (and gaiamock's simulations, for G < 13) contains.
+        ln L then includes the normalization: -(sum of r^2/sigma^2 + ln(2 pi sigma^2))/2, with sigma^2 = ast_err^2 + s^2
+        (see estimate_astrometric_jitter() for a starting value).
     '''
     theta = np.asarray(theta, dtype=np.float64)
+    ast_jitter = None
+    if fit_ast_jitter:
+        theta, ast_jitter = theta[:-1], theta[-1]
+        if not ast_jitter >= 0:
+            return -np.inf
     n_pl = (len(theta) - 5)//7
     if len(theta) != 5 + 7*n_pl:
         raise ValueError('theta must have 5 + 7 N entries.')
     if not _orbits_valid(theta[5::7], theta[6::7]):
         return -np.inf
     prob = _Problem(ast=(t_ast_yr, psi, plx_factor, ast_obs, ast_err), c_funcs_plus=c_funcs_plus)
-    lnL = _ast_log_like(prob.residuals(theta, n_pl), reject_outlier)
+    lnL = _ast_log_like(prob.residuals(theta, n_pl), reject_outlier, prob.data[4], ast_jitter)
     return lnL if np.isfinite(lnL) else -np.inf
 
 def log_likelihood_rv_planets(theta, t_rvs_yr, rv, rv_err, rv_dataset=None, jitter=None, c_funcs_plus=None):
@@ -1808,7 +1829,7 @@ def log_likelihood_rv_planets(theta, t_rvs_yr, rv, rv_err, rv_dataset=None, jitt
     return lnL if np.isfinite(lnL) else -np.inf
 
 def log_likelihood_astrometry_and_rv_planets(theta, t_ast_yr, psi, plx_factor, ast_obs, ast_err, t_rvs_yr, rv, rv_err, rv_dataset=None,
-                                             jitter=None, reject_outlier=False, c_funcs=None, c_funcs_plus=None):
+                                             jitter=None, reject_outlier=False, fit_ast_jitter=False, c_funcs=None, c_funcs_plus=None):
     '''
     ln L of epoch astrometry and RVs for N planets (no priors): the sum of log_likelihood_astrometry_planets() and
     log_likelihood_rv_planets() for the same orbits, with theta ordered as the 'theta' of
@@ -1816,8 +1837,16 @@ def log_likelihood_astrometry_and_rv_planets(theta, t_ast_yr, psi, plx_factor, a
     phi_p, Omega, inc, w, a0_mas, then gamma for each RV dataset), followed by the jitter of each dataset (km/s)
     unless jitter is given (then fixed at those values). Angles in radians; the conventions are those of
     astrometry_and_rv_planets_model() (K follows from a0, parallax, inc, P and e). N is set by the length of theta.
+    fit_ast_jitter: if True, the last entry of theta (after the RV jitters) is an astrometric jitter, as in
+        log_likelihood_astrometry_planets().
     '''
     t, rv, rv_err, sets, n_sets = _rv_data(t_rvs_yr, rv, rv_err, rv_dataset)
+    theta = np.asarray(theta, dtype=np.float64)
+    ast_jitter = None
+    if fit_ast_jitter:
+        theta, ast_jitter = theta[:-1], theta[-1]
+        if not ast_jitter >= 0:
+            return -np.inf
     theta, jit = _split_jitter(theta, n_sets, jitter)
     n_pl = (len(theta) - 5 - n_sets)//7
     if len(theta) != 5 + 7*n_pl + n_sets:
@@ -1828,10 +1857,27 @@ def log_likelihood_astrometry_and_rv_planets(theta, t_ast_yr, psi, plx_factor, a
     prob = _Problem(ast=(t_ast_yr, psi, plx_factor, ast_obs, ast_err), rv=(t, rv, rv_err, sets), c_funcs_plus=c_funcs_plus)
     prob.set_jitter(jit)
     resid = _JointModel(prob, _get_c_funcs(c_funcs), np.ones(prob.n, dtype=bool)).residuals(phys, gamma=gamma)
-    lnL = _ast_log_like(resid[:prob.n], reject_outlier) + _rv_log_like(resid[prob.n:prob.n + prob.n_rv], prob.rv_err_eff)
+    lnL = _ast_log_like(resid[:prob.n], reject_outlier, prob.data[4], ast_jitter) + _rv_log_like(resid[prob.n:prob.n + prob.n_rv], prob.rv_err_eff)
     return lnL if np.isfinite(lnL) else -np.inf
 
-def initial_walkers(fit_result, nwalkers, log_prob=None, scatter=1e-3, include_jitter=None, rng=None):
+def estimate_astrometric_jitter(fit_result, ast_err):
+    '''
+    A starting value for the astrometric jitter (mas), from the quality of the best fit of fit_astrometry_planets() or
+    fit_astrometry_and_rv_planets(): the jitter s that makes the reduced chi2 of the astrometric residuals 1, i.e.
+    s^2 = <ast_err^2> (chi2/nu - 1), or 0 if chi2/nu <= 1 (exact for equal uncertainties). ast_err: the reported
+    epoch uncertainties used in the fit.
+    '''
+    if 'chi2_ast' in fit_result: # joint fit: the astrometric chi2 and the number of free astrometric parameters
+        n_ast_par = 5 + 7*fit_result['n_planets']
+        if fit_result.get('free_indices') is not None:
+            n_ast_par = int(np.sum(np.asarray(fit_result['free_indices']) < n_ast_par))
+        chi2, nu = fit_result['chi2_ast'], fit_result['n_used'] - n_ast_par
+    else:
+        chi2, nu = fit_result['chi2_data'], fit_result['nu']
+    ast_err = np.asarray(ast_err, dtype=np.float64)
+    return float(np.sqrt(max(chi2/nu - 1, 0.0)*np.mean(ast_err**2)))
+
+def initial_walkers(fit_result, nwalkers, log_prob=None, scatter=1e-3, include_jitter=None, ast_jitter=None, rng=None):
     '''
     Starting positions for MCMC walkers in a small ball around the best fit of fit_astrometry_planets(),
     fit_rv_planets() or fit_astrometry_and_rv_planets(): theta + scatter * sigma * N(0, 1) for each parameter, where
@@ -1844,6 +1890,9 @@ def initial_walkers(fit_result, nwalkers, log_prob=None, scatter=1e-3, include_j
     If the fit had fixed parameters, the walkers contain only the free parameters (fit_result['theta_names'] at
     fit_result['free_indices'], then the jitters), and log_prob is called with these: full_theta() returns the full
     parameter vector that the likelihood functions need.
+    ast_jitter: if given (mas, e.g. from estimate_astrometric_jitter()), an astrometric jitter is appended as the last
+    parameter (scattered by scatter * ast_jitter, or by scatter * 0.01 mas if it is 0, and kept non-negative), as the
+    likelihood functions expect with fit_ast_jitter=True.
     rng: optional numpy Generator; if None, the global np.random state is used.
     '''
     rng = _get_rng(rng)
@@ -1860,6 +1909,9 @@ def initial_walkers(fit_result, nwalkers, log_prob=None, scatter=1e-3, include_j
     if include_jitter:
         jit = np.asarray(fit_result['jitter'], dtype=np.float64)
         theta, sig, n_jit = np.concatenate([theta, jit]), np.concatenate([sig, np.where(jit > 0, jit, 1e-3)]), len(jit)
+    if ast_jitter is not None:
+        theta, sig = np.append(theta, float(ast_jitter)), np.append(sig, float(ast_jitter) if ast_jitter > 0 else 0.01)
+        n_jit += 1
     walkers = []
     for _ in range(1000*nwalkers):
         p = theta + scatter*sig*rng.normal(0, 1, len(theta))
@@ -1876,7 +1928,7 @@ def full_theta(theta_free, fit_result):
     '''
     The full parameter vector for the likelihood functions, from the free parameters of a fit with fixed parameters
     (as returned by initial_walkers(), i.e. the parameters at fit_result['free_indices'], optionally followed by the
-    jitters): the fixed parameters are set to their values (and, with a fixed Tp, phi_p = 2 pi Tp/P). Without fixed
+    jitters, and the astrometric jitter): the fixed parameters are set to their values (and, with a fixed Tp, phi_p = 2 pi Tp/P). Without fixed
     parameters, theta_free is returned unchanged.
     '''
     theta_free = np.asarray(theta_free, dtype=np.float64)
