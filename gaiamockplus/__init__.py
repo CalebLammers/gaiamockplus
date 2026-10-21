@@ -473,6 +473,161 @@ OPTIMIZER_SETTINGS = {
 _EMPTY_DBL = np.zeros(1)
 _EMPTY_INT = np.zeros(1, dtype=np.int32)
 
+# ---------------------------------------------------------------- fixed parameters
+
+FIXABLE_PARAMETERS = ('period', 'Tp', 'ecc')               # all fitting functions
+FIXABLE_PARAMETERS_JOINT = FIXABLE_PARAMETERS + ('inc', 'Omega') # also fit_astrometry_and_rv_planets()
+
+class _Fixed:
+    '''
+    Fixed parameters of each planet (planets ordered by period): a list with one dict per planet, with any of the keys
+    period, Tp, ecc (and, for joint fits, inc, Omega). A fixed Tp fixes the phase phi_p = 2 pi Tp/P, which moves with P
+    if P is free. For a circular orbit (ecc fixed at 0), the phase and w are degenerate, so the phase is held fixed
+    (at Tp if given, otherwise at its best-fit value); in joint fits, w then carries the orbital phase.
+    '''
+    def __init__(self, per_planet):
+        self.p = per_planet
+        self.n = len(per_planet)
+
+    def subset(self, idx):
+        return _Fixed([self.p[i] for i in idx])
+
+    def phase(self, i, P):
+        return 2*np.pi*np.mod(self.p[i]['Tp']/P, 1)
+
+    def phase_fixed(self, i):
+        return 'Tp' in self.p[i] or self.p[i].get('ecc') == 0.0
+
+    def nonlinear(self, P, phi, e):
+        '''(P, phi, e) with the fixed values set, and a mask of shape (n, 3) of the free ones'''
+        P, phi, e = (np.array(a, dtype=np.float64) for a in (P, phi, e))
+        free = np.ones((self.n, 3), dtype=bool)
+        for i, f in enumerate(self.p):
+            if 'period' in f:
+                P[i], free[i, 0] = f['period'], False
+            if 'ecc' in f:
+                e[i], free[i, 2] = f['ecc'], False
+            if 'Tp' in f:
+                phi[i] = self.phase(i, P[i])
+            free[i, 1] = not self.phase_fixed(i)
+        return P, phi, e, free
+
+    def transform(self, theta, offset, stride, extra=()):
+        '''
+        For a parameter vector theta in which planet i's (P, e, phi_p) are at offset + stride*i + (0, 1, 2) (and the
+        parameters named in extra at offset + stride*i + position): the indices of the free parameters, and the matrix
+        T (len(theta) x n_free) such that small changes of the free parameters x change theta by T x (with a fixed Tp,
+        a change of P also changes phi_p = 2 pi Tp/P).
+        '''
+        fixed_idx, dependent = set(), {}
+        for i, f in enumerate(self.p):
+            k = offset + stride*i
+            if 'period' in f:
+                fixed_idx.add(k)
+            if 'ecc' in f:
+                fixed_idx.add(k + 1)
+            if self.phase_fixed(i):
+                fixed_idx.add(k + 2)
+            if 'Tp' in f and 'period' not in f:
+                dependent[k] = (k + 2, -2*np.pi*f['Tp']/theta[k]**2)
+            for name, position in extra:
+                if name in f:
+                    fixed_idx.add(k + position)
+        free_idx = np.array([j for j in range(len(theta)) if j not in fixed_idx], dtype=int)
+        T = np.zeros((len(theta), len(free_idx)))
+        for c, j in enumerate(free_idx):
+            T[j, c] = 1.0
+            if j in dependent:
+                T[dependent[j][0], c] = dependent[j][1]
+        return free_idx, T
+
+def _transform_or_identity(fixed, theta, offset, stride, extra=()):
+    if fixed is None:
+        return np.arange(len(theta)), np.eye(len(theta))
+    return fixed.transform(theta, offset, stride, extra)
+
+def _parse_fixed(fixed, n_planets, initial_planets, allowed, P_min, P_max, e_max):
+    '''Check the fixed argument of a fitting function (a dict such as {'period_0': 20.0, 'ecc_0': 0.0}) and return a _Fixed (or None).'''
+    if not fixed:
+        return None
+    if not isinstance(fixed, dict):
+        raise ValueError("fixed must be a dict such as {'period_0': 20.0, 'ecc_0': 0.0}.")
+    n = len(initial_planets) if initial_planets is not None else n_planets
+    if n is None:
+        raise ValueError('fixed parameters need a known number of planets (n_planets or initial_planets).')
+    per_planet = [dict() for _ in range(int(n))]
+    for key, value in fixed.items():
+        name, sep, index = str(key).rpartition('_')
+        if not sep or name not in allowed or not index.isdigit() or int(index) >= n:
+            raise ValueError("fixed key %r is not supported: keys are <name>_<i>, with i the index of the planet in order of period "
+                             "(0 to %d) and name one of %s." % (key, n - 1, list(allowed)))
+        value = float(value)
+        if not np.isfinite(value):
+            raise ValueError('fixed %s must be finite.' % key)
+        if name == 'period' and not (P_min <= value <= P_max):
+            raise ValueError('fixed %s must be within P_min and P_max.' % key)
+        if name == 'ecc' and not (0 <= value <= e_max):
+            raise ValueError('fixed %s must be between 0 and e_max.' % key)
+        if name == 'inc' and not (0 <= value <= np.pi):
+            raise ValueError('fixed %s must be between 0 and pi.' % key)
+        per_planet[int(index)][name] = value
+    return _Fixed(per_planet)
+
+def _polish_fixed(prob, P, phi, e, free_planets, max_restarts=10):
+    '''
+    Nelder-Mead polish of the free nonlinear parameters, with the fixed ones (prob.fixed) held at their values, in
+    (log P, phi, e). Returns P, phi, e, objective (chi2 + all priors), and chi2, as _Problem.polish().
+    '''
+    from scipy.optimize import minimize
+    from scipy.stats import beta
+    fixed = prob.fixed
+    P, phi, e, free = fixed.nonlinear(P, phi, e)
+    free &= (np.asarray(free_planets) != 0)[:, None]
+    tp = [i for i in range(fixed.n) if 'Tp' in fixed.p[i]]
+    idx = np.argwhere(free)
+    def unpack(x):
+        P_, phi_, e_ = P.copy(), phi.copy(), e.copy()
+        for (i, c), v in zip(idx, x):
+            if c == 0:
+                P_[i] = np.exp(v)
+            elif c == 1:
+                phi_[i] = np.mod(v, 2*np.pi)
+            else:
+                e_[i] = v
+        for i in tp:
+            phi_[i] = fixed.phase(i, P_[i])
+        return P_, phi_, e_
+    def objective(x):
+        P_, phi_, e_ = unpack(x)
+        e_free = e_[free[:, 2]]
+        if np.any(P_ < prob.L[0]) or np.any(P_ > prob.U[0]) or np.any(e_free < prob.L[2]) or np.any(e_free > prob.U[2]):
+            return np.inf
+        f = prob.chi2(P_, phi_, e_)[0]
+        if prob.ecc_a > 0 and len(e_free):
+            f += -2*np.sum(beta.logpdf(e_free, prob.ecc_a, prob.ecc_b))
+        return f if np.isfinite(f) else np.inf
+    x = np.array([np.log(P[i]) if c == 0 else (phi[i] if c == 1 else e[i]) for i, c in idx])
+    step = np.array([(0.05, 0.25, 0.08)[c] for _, c in idx])
+    best = objective(x)
+    for _ in range(max_restarts if len(x) else 0):
+        simplex = [x]
+        for k in range(len(x)):
+            v = x.copy()
+            v[k] += step[k]
+            if idx[k][1] == 2 and v[k] > prob.U[2]:
+                v[k] = x[k] - step[k]
+            simplex.append(v)
+        res = minimize(objective, x, method='Nelder-Mead', options=dict(initial_simplex=np.array(simplex), xatol=1e-10, fatol=1e-10,
+                                                                         maxiter=2000*len(x), adaptive=len(x) > 4))
+        improved = res.fun < best - 1e-9
+        if res.fun <= best:
+            x, best = res.x, res.fun
+        step = step/2
+        if not improved:
+            break
+    P_, phi_, e_ = unpack(x)
+    return P_, phi_, e_, best, prob.chi2(P_, phi_, e_)[0]
+
 class _Problem:
     '''
     A fitting problem: epoch astrometry and/or RVs, plus fitting options, with thin wrappers around the compiled
@@ -502,6 +657,7 @@ class _Problem:
         # bounds on (P, phi_p, ecc), as in gaiamock (which also uses e >= 1e-6 with an eccentricity prior)
         self.L = np.array([float(P_min), 0., 1e-6 if eccentricity_prior is not None else 0.])
         self.U = np.array([float(P_max), 2*np.pi, float(e_max)])
+        self.fixed = None # fixed parameters (a _Fixed), applied by polish() once the planets are found
 
     def set_jitter(self, jitter):
         '''Set the RV jitter (km/s, one value per RV dataset), added in quadrature to rv_err.'''
@@ -552,8 +708,11 @@ class _Problem:
         Nelder-Mead polish of the free planets (by default with the tolerances of gaiamock's "full" optimizer, restarted
         until the objective stops improving), in (log P, e cos(phi), e sin(phi)) if smooth (default; cannot get stuck
         at e = 0 or at the phi = 0/2 pi boundary) or in gaiamock's (log P, phi, e). Returns P, phi, e (polished copies),
-        objective (chi2 + all priors), and chi2 (all datasets + parallax-prior term).
+        objective (chi2 + all priors), and chi2 (all datasets + parallax-prior term). If the problem has fixed parameters
+        (self.fixed, for planets ordered by period), they are held at their values (see _polish_fixed()).
         '''
+        if self.fixed is not None:
+            return _polish_fixed(self, *_nonlinear_arrays(P, phi, e), free)
         P, phi, e = (np.array(a, dtype=np.float64) for a in _nonlinear_arrays(P, phi, e))
         P, phi, e = np.clip(P, self.L[0], self.U[0]), np.clip(phi, self.L[1], self.U[1]), np.clip(e, self.L[2], self.U[2])
         out = np.zeros(5)
@@ -676,7 +835,7 @@ def _rv_weights_changed(prob, jitter_a, jitter_b, tol=0.05):
     return np.max(np.abs(np.log(sig_a/sig_b))) > tol
 
 def _fit_planets(prob, n_planets, max_planets, delta_chi2_min, initial_planets, optimizer, n_joint, refine, n_beam, verbose,
-                 n_base_params, n_params_per_planet, settle=_settle_none):
+                 n_base_params, n_params_per_planet, settle=_settle_none, fixed=None):
     '''
     The search shared by all fitting functions: add one planet at a time with gaiamock's search (_search_one_planet),
     optionally refining and keeping a beam of solutions, until n_planets are fit (known-N mode) or the detection
@@ -687,6 +846,8 @@ def _fit_planets(prob, n_planets, max_planets, delta_chi2_min, initial_planets, 
     n_base_params + n_params_per_planet*N free parameters, which must leave at least one degree of freedom.
     Returns P, phi, e (arrays), objective, the statistic for 0, 1, ... planets, the rejected candidate, the number of
     planets searched, and whether this was a blind search.
+    fixed (a _Fixed, or None): fixed parameters of the planets in order of period, applied once the planets are found
+    (the planets are then sorted by period, and polished and settled with these values held fixed).
     '''
     if delta_chi2_min is None:
         delta_chi2_min = DEFAULT_DELTA_CHI2_MIN
@@ -752,20 +913,28 @@ def _fit_planets(prob, n_planets, max_planets, delta_chi2_min, initial_planets, 
             beam = [best] + children[1:]
             sol = best
             history.append(stat)
+    if fixed is not None:
+        order = np.argsort(sol[0])
+        prob.fixed = fixed
+        sol, _ = settle(prob, prob.polish(sol[0][order], sol[1][order], sol[2][order], np.ones(len(order), dtype=np.int32)))
     return sol, history, rejected, n_target, blind
 
 def _leave_one_out(prob, sol, history, settle):
     '''For each planet (in order of period), the increase of the detection statistic when it is removed and the other
     planets are re-polished (and settled). The problem's adjustable parameters (jitter) are restored afterwards.'''
     P, phi, e = sol[:3]
-    jitter = prob.jitter.copy()
+    jitter, fixed = prob.jitter.copy(), prob.fixed
     _, stat_full = settle(prob, sol)
     deltas = []
     for i in np.argsort(P):
         others = [j for j in range(len(P)) if j != i]
         if others:
-            reduced = prob.polish(P[others], phi[others], e[others], np.ones(len(others), dtype=np.int32))
-            stat_without = settle(prob, reduced)[1]
+            prob.fixed = fixed.subset(others) if fixed is not None else None
+            try:
+                reduced = prob.polish(P[others], phi[others], e[others], np.ones(len(others), dtype=np.int32))
+                stat_without = settle(prob, reduced)[1]
+            finally:
+                prob.fixed = fixed
         else:
             stat_without = history[0]
         deltas.append(stat_without - stat_full)
@@ -858,13 +1027,14 @@ def _astrometry_fit_summary(prob, P, phi, e, m_star, binned):
             H_e = (prob.ecc_a - 1)/ei**2 + (prob.ecc_b - 1)/(1 - ei)**2
             if H_e > 0:
                 JTJ[5 + 7*i + 1, 5 + 7*i + 1] += H_e
+    free_idx, T = _transform_or_identity(prob.fixed, theta, 5, 7) # fixed parameters have no uncertainty
     try:
-        cov = np.linalg.inv(JTJ)
+        cov = T @ np.linalg.inv(T.T @ JTJ @ T) @ T.T
     except np.linalg.LinAlgError:
         cov = np.full_like(JTJ, np.nan)
 
     chi2_data = np.sum(resid(theta)**2)
-    n_used, n_par = int(keep.sum()), len(theta)
+    n_used, n_par = int(keep.sum()), len(free_idx)
     nu = n_used - n_par
     F2, uwe, cc = _astrometric_goodness_of_fit(chi2_data, n_used, n_par, binned)
     cov = cc**2*cov
@@ -872,6 +1042,8 @@ def _astrometry_fit_summary(prob, P, phi, e, m_star, binned):
 
     result = dict(n_planets=K, chi2=chi2_total, chi2_data=chi2_data, n_obs=prob.n, n_used=n_used, n_params=n_par, nu=nu, F2=F2, uwe=uwe,
                   uncertainty_scale=cc, outlier_index=worst, theta=theta, theta_names=names, cov=cov)
+    if prob.fixed is not None:
+        result['free_indices'] = free_idx
     for j, name in enumerate(names[:5]):
         result[name], result['sig_' + name] = theta[j], sig[j]
 
@@ -895,7 +1067,8 @@ DEFAULT_DELTA_CHI2_MIN = 50.0
 
 def fit_astrometry_planets(t_ast_yr, psi, plx_factor, ast_obs, ast_err, n_planets=None, max_planets=3, delta_chi2_min=None, m_star=None,
                            P_min=10., P_max=1e4, e_max=0.99, parallax_prior=None, eccentricity_prior=None, reject_outlier=False, binned=True,
-                           initial_planets=None, optimizer='periodogram_multistart', n_joint=3, refine=True, n_beam=1, verbose=False, c_funcs_plus=None):
+                           initial_planets=None, optimizer='periodogram_multistart', n_joint=3, refine=True, n_beam=1, verbose=False, c_funcs_plus=None,
+                           fixed=None):
     '''
     Fit epoch astrometry with a model of a star hosting several planets (dark companions), adding one planet at a time.
 
@@ -941,6 +1114,14 @@ def fit_astrometry_planets(t_ast_yr, psi, plx_factor, ast_obs, ast_err, n_planet
     n_beam: number of solutions carried forward to the next planet's search (default 1). Larger values make the search
         more robust to near-ties between a true and a spurious solution, at proportionally higher cost.
     c_funcs_plus: from read_in_C_functions_plus() (read in automatically if None).
+    fixed: optional dict of parameters held fixed at the given values, keyed by <name>_<i>, where i is the index of
+        the planet in order of period (0 = shortest) and name is one of 'period', 'Tp', 'ecc' (gaiamock units: days, radians), e.g.
+        {'period_0': 20.0, 'ecc_0': 0.0}. Needs n_planets or initial_planets. The planets are found as usual, then
+        polished with these values held fixed. Fixed parameters have zero uncertainty, and are not counted as free
+        parameters. A fixed Tp fixes the phase phi_p = 2 pi Tp/P (which moves with P if P is free). For a circular
+        orbit (ecc fixed at 0), the phase and w are degenerate, so the phase is held fixed (at Tp if given, otherwise
+        at its best-fit value). The result then includes fixed (the dict) and free_indices (the indices of the free
+        parameters in theta); see initial_walkers() and full_theta() for MCMC sampling of the free parameters.
 
     returns a dict with:
         n_planets, planets (list of dicts, sorted by period, each with period, ecc, phi_p, Tp, A, B, F, G, a0_mas,
@@ -955,13 +1136,17 @@ def fit_astrometry_planets(t_ast_yr, psi, plx_factor, ast_obs, ast_err, n_planet
     Note: astrometry alone cannot distinguish (Omega, w) from (Omega + pi, w + pi); Omega is returned in [0, pi).
     '''
     prob = _AstrometryProblem(t_ast_yr, psi, plx_factor, ast_obs, ast_err, parallax_prior, eccentricity_prior, reject_outlier, P_min, P_max, e_max, c_funcs_plus)
+    fixed_input = fixed
+    fixed = _parse_fixed(fixed, n_planets, initial_planets, FIXABLE_PARAMETERS, P_min, P_max, e_max)
     sol, history, rejected, n_target, blind = _fit_planets(prob, n_planets, max_planets, delta_chi2_min, initial_planets, optimizer, n_joint,
-                                                           refine, n_beam, verbose, 5, 7)
+                                                           refine, n_beam, verbose, 5, 7, fixed=fixed)
     result = _astrometry_fit_summary(prob, *sol[:3], m_star, binned)
     for planet, delta in zip(result['planets'], _leave_one_out(prob, sol, history, _settle_none)):
         planet['delta_chi2'] = delta
     result['chi2_history'] = history
     result['objective'] = sol[3]
+    if fixed is not None:
+        result['fixed'] = dict(fixed_input)
     if blind:
         result['rejected_candidate'] = rejected
         result['max_planets_searched'] = n_target
@@ -1068,15 +1253,18 @@ def _rv_fit_summary(prob, P, phi, e, m_star):
             H_e = (prob.ecc_a - 1)/ei**2 + (prob.ecc_b - 1)/(1 - ei)**2
             if H_e > 0:
                 JTJ[S + 5*i + 1, S + 5*i + 1] += H_e
+    free_idx, T = _transform_or_identity(prob.fixed, theta, S, 5) # fixed parameters have no uncertainty
     try:
-        cov = np.linalg.inv(JTJ)
+        cov = T @ np.linalg.inv(T.T @ JTJ @ T) @ T.T
     except np.linalg.LinAlgError:
         cov = np.full_like(JTJ, np.nan)
     sig = np.sqrt(np.abs(np.diag(cov)))
-    n_par = len(theta)
+    n_par = len(free_idx)
     result = dict(n_planets=K_pl, chi2=chi2, minus_2_ln_like=prob.minus_2_ln_like(chi2), n_rv=prob.n_rv, n_params=n_par,
                   nu=prob.n_rv - n_par, chi2_red=chi2/(prob.n_rv - n_par) if prob.n_rv > n_par else np.nan,
                   gamma=theta[:S].copy(), sig_gamma=sig[:S].copy(), jitter=prob.jitter.copy(), theta=theta, theta_names=names, cov=cov)
+    if prob.fixed is not None:
+        result['free_indices'] = free_idx
 
     planets, model_planets = [], []
     for i in range(K_pl):
@@ -1095,7 +1283,7 @@ def _rv_fit_summary(prob, P, phi, e, m_star):
 
 def fit_rv_planets(t_rvs_yr, rv, rv_err, rv_dataset=None, n_planets=None, max_planets=3, delta_chi2_min=None, m_star=None,
                    P_min=10., P_max=1e4, e_max=0.99, eccentricity_prior=None, fit_jitter=True, jitter=None, initial_planets=None,
-                   optimizer='periodogram_multistart', n_joint=3, refine=True, n_beam=1, verbose=False, c_funcs_plus=None):
+                   optimizer='periodogram_multistart', n_joint=3, refine=True, n_beam=1, verbose=False, c_funcs_plus=None, fixed=None):
     '''
     Fit radial velocities with a model of a star hosting several planets, adding one planet at a time, with the same
     search as fit_astrometry_planets(): gaiamock's "periodogram_multistart" optimizer for each new planet (the
@@ -1129,6 +1317,14 @@ def fit_rv_planets(t_rvs_yr, rv, rv_err, rv_dataset=None, n_planets=None, max_pl
         reference epoch) and 'ecc'. If given, no search is done: the planets are polished jointly from these guesses.
     optimizer, n_joint, refine, n_beam: search settings, as in fit_astrometry_planets().
     c_funcs_plus: from read_in_C_functions_plus() (read in automatically if None).
+    fixed: optional dict of parameters held fixed at the given values, keyed by <name>_<i>, where i is the index of
+        the planet in order of period (0 = shortest) and name is one of 'period', 'Tp', 'ecc' (gaiamock units: days, radians), e.g.
+        {'period_0': 20.0, 'ecc_0': 0.0}. Needs n_planets or initial_planets. The planets are found as usual, then
+        polished with these values held fixed (and the jitter re-fit). Fixed parameters have zero uncertainty, and are not counted as free
+        parameters. A fixed Tp fixes the phase phi_p = 2 pi Tp/P (which moves with P if P is free). For a circular
+        orbit (ecc fixed at 0), the phase and w are degenerate, so the phase is held fixed (at Tp if given, otherwise
+        at its best-fit value). The result then includes fixed (the dict) and free_indices (the indices of the free
+        parameters in theta); see initial_walkers() and full_theta() for MCMC sampling of the free parameters.
 
     returns a dict with:
         n_planets, planets (list of dicts, sorted by period, each with period, ecc, phi_p, Tp, K (km/s), w (radians),
@@ -1151,14 +1347,18 @@ def fit_rv_planets(t_rvs_yr, rv, rv_err, rv_dataset=None, n_planets=None, max_pl
         prob.set_jitter(jitter)
     settle = _settle_rv if fit_jitter else _settle_rv_fixed_jitter
     n_base = prob.n_sets*(2 if fit_jitter else 1)
+    fixed_input = fixed
+    fixed = _parse_fixed(fixed, n_planets, initial_planets, FIXABLE_PARAMETERS, P_min, P_max, e_max)
     sol, history, rejected, n_target, blind = _fit_planets(prob, n_planets, max_planets, delta_chi2_min, initial_planets, optimizer, n_joint,
-                                                           refine, n_beam, verbose, n_base, 5, settle)
+                                                           refine, n_beam, verbose, n_base, 5, settle, fixed=fixed)
     result = _rv_fit_summary(prob, *sol[:3], m_star)
     for planet, delta in zip(result['planets'], _leave_one_out(prob, sol, history, settle)):
         planet['delta_chi2'] = delta
     result['chi2_history'] = history
     result['fit_jitter'] = bool(fit_jitter)
     result['objective'] = sol[3]
+    if fixed is not None:
+        result['fixed'] = dict(fixed_input)
     if blind:
         result['rejected_candidate'] = rejected
         result['max_planets_searched'] = n_target
@@ -1277,6 +1477,30 @@ def _joint_start(prob, sol):
         theta += [P[i], e[i], phi[i], Omega, inc, w, a0]
     return np.array(theta), worst
 
+_JOINT_EXTRA = (('Omega', 3), ('inc', 4)) # positions of the other fixable parameters of each planet in the joint theta
+
+def _apply_fixed_physical(theta, fixed):
+    '''
+    Set the fixed parameters of each planet in a joint theta (P, e, phi_p, Omega, inc, w, a0 per planet). When inc is
+    fixed, a0 is rescaled to keep the RV semi-amplitude (K ~ a0 sin(inc)) of the starting point.
+    '''
+    theta = theta.copy()
+    for i, f in enumerate(fixed.p):
+        k = 5 + 7*i
+        if 'period' in f:
+            theta[k] = f['period']
+        if 'ecc' in f:
+            theta[k + 1] = f['ecc']
+        if 'Tp' in f:
+            theta[k + 2] = fixed.phase(i, theta[k])
+        if 'Omega' in f:
+            theta[k + 3] = f['Omega']
+        if 'inc' in f:
+            if np.sin(f['inc']) > 1e-6:
+                theta[k + 6] *= abs(np.sin(theta[k + 4]))/np.sin(f['inc'])
+            theta[k + 4] = f['inc']
+    return theta
+
 def _refine_joint(prob, sol, c_funcs, fit_jitter, max_cycles=20):
     '''
     Exact joint fit of astrometry and RVs, starting from a linked solution: least squares over the physical parameters
@@ -1287,6 +1511,9 @@ def _refine_joint(prob, sol, c_funcs, fit_jitter, max_cycles=20):
     from scipy.optimize import least_squares
     theta, worst = _joint_start(prob, sol)
     n_pl = (len(theta) - 5)//7
+    fixed = prob.fixed
+    if fixed is not None:
+        theta = _apply_fixed_physical(theta, fixed)
     lo = np.full(len(theta), -np.inf); hi = np.full(len(theta), np.inf)
     lo[2] = 1e-6 # the RV amplitude needs a positive parallax
     for i in range(n_pl):
@@ -1295,7 +1522,17 @@ def _refine_joint(prob, sol, c_funcs, fit_jitter, max_cycles=20):
         lo[k + 1], hi[k + 1] = prob.L[2], prob.U[2]       # e
         lo[k + 4], hi[k + 4] = 0., np.pi                  # inc
         lo[k + 6] = 0.                                    # a0
-    theta = np.clip(theta, lo, hi)
+    free_idx, _ = _transform_or_identity(fixed, theta, 5, 7, _JOINT_EXTRA)
+    theta[free_idx] = np.clip(theta[free_idx], lo[free_idx], hi[free_idx])
+    def expand(x):
+        '''theta with the free parameters x (a fixed Tp sets phi_p from P)'''
+        th = theta.copy()
+        th[free_idx] = x
+        if fixed is not None:
+            for i in range(n_pl):
+                if 'Tp' in fixed.p[i]:
+                    th[5 + 7*i + 2] = fixed.phase(i, th[5 + 7*i])
+        return th
     for attempt in range(2):
         keep = np.ones(prob.n, dtype=bool)
         if worst >= 0:
@@ -1304,7 +1541,9 @@ def _refine_joint(prob, sol, c_funcs, fit_jitter, max_cycles=20):
         previous = np.inf
         for _ in range(max_cycles):
             if n_pl > 0 or prob.n_rv > 0:
-                theta = least_squares(model.residuals, theta, bounds=(lo, hi), x_scale='jac', xtol=1e-12, ftol=1e-12, gtol=1e-12, max_nfev=5000).x
+                x = least_squares(lambda x: model.residuals(expand(x)), theta[free_idx], bounds=(lo[free_idx], hi[free_idx]), x_scale='jac',
+                                  xtol=1e-12, ftol=1e-12, gtol=1e-12, max_nfev=5000).x
+                theta = expand(x)
             if fit_jitter and prob.n_rv > 0:
                 model.fit_jitter(theta)
             stat = model.minus_2_ln_like(theta)
@@ -1328,6 +1567,7 @@ def _joint_fit_summary(model, theta, m_star, binned):
     # order the planets by period, and wrap the angles
     order = np.argsort(theta[5::7])
     theta = np.concatenate([theta[:5]] + [theta[5 + 7*i: 12 + 7*i] for i in order])
+    fixed = prob.fixed.subset(order) if prob.fixed is not None else None
     for i in range(n_pl):
         k = 5 + 7*i
         theta[k + 2] = np.mod(theta[k + 2], 2*np.pi); theta[k + 3] = np.mod(theta[k + 3], 2*np.pi); theta[k + 5] = np.mod(theta[k + 5], 2*np.pi)
@@ -1335,7 +1575,9 @@ def _joint_fit_summary(model, theta, m_star, binned):
     gamma = model.gamma(rv_pl)
     chi2_ast, chi2_rv, prior = model.chi2_parts(theta)
     n_used = int(model.keep.sum())
-    F2, uwe, cc = _astrometric_goodness_of_fit(chi2_ast, n_used, 5 + 7*n_pl, binned)
+    free_idx, T = _transform_or_identity(fixed, np.concatenate([theta, gamma]), 5, 7, _JOINT_EXTRA) # fixed parameters have no uncertainty
+    n_fixed = len(theta) + len(gamma) - len(free_idx)
+    F2, uwe, cc = _astrometric_goodness_of_fit(chi2_ast, n_used, 5 + 7*n_pl - n_fixed, binned)
 
     # Jacobian of all residuals with respect to (theta, gamma), with the astrometric errors scaled by cc as in gaiamock
     full = np.concatenate([theta, gamma])
@@ -1349,7 +1591,7 @@ def _joint_fit_summary(model, theta, m_star, binned):
         up[j] += h; down[j] -= h
         J[:, j] = (resid(up) - resid(down))/(2*h)
     try:
-        cov = np.linalg.inv(J.T @ J)
+        cov = T @ np.linalg.inv(T.T @ J.T @ J @ T) @ T.T
     except np.linalg.LinAlgError:
         cov = np.full((len(full), len(full)), np.nan)
     sig = np.sqrt(np.abs(np.diag(cov)))
@@ -1360,6 +1602,8 @@ def _joint_fit_summary(model, theta, m_star, binned):
                   n_obs=prob.n, n_used=n_used, n_rv=prob.n_rv, F2=F2, uwe=uwe, uncertainty_scale=cc,
                   outlier_index=int(np.where(~model.keep)[0][0]) if (~model.keep).any() else -1,
                   gamma=gamma, sig_gamma=sig[len(theta):], jitter=prob.jitter.copy(), theta=full, theta_names=names, cov=cov)
+    if fixed is not None:
+        result['free_indices'] = free_idx
     for j, name in enumerate(names[:5]):
         result[name], result['sig_' + name] = full[j], sig[j]
 
@@ -1397,7 +1641,8 @@ def _joint_fit_summary(model, theta, m_star, binned):
 def fit_astrometry_and_rv_planets(t_ast_yr, psi, plx_factor, ast_obs, ast_err, t_rvs_yr, rv, rv_err, rv_dataset=None, n_planets=None,
                                   max_planets=3, delta_chi2_min=None, m_star=None, P_min=10., P_max=1e4, e_max=0.99, parallax_prior=None,
                                   eccentricity_prior=None, reject_outlier=False, binned=True, fit_jitter=True, jitter=None, initial_planets=None,
-                                  optimizer='periodogram_multistart', n_joint=3, refine=True, n_beam=1, verbose=False, c_funcs=None, c_funcs_plus=None):
+                                  optimizer='periodogram_multistart', n_joint=3, refine=True, n_beam=1, verbose=False, c_funcs=None, c_funcs_plus=None,
+                                  fixed=None):
     '''
     Fit Gaia epoch astrometry and radial velocities jointly with a model of a star hosting several planets, in two steps:
     1. A linked search, with the same search as fit_astrometry_planets() and fit_rv_planets() (gaiamock's
@@ -1420,6 +1665,15 @@ def fit_astrometry_and_rv_planets(t_ast_yr, psi, plx_factor, ast_obs, ast_err, t
     parallax_prior, eccentricity_prior (Beta(a, b) with a, b >= 1), reject_outlier (astrometry), binned, P_min, P_max,
         e_max, fit_jitter, jitter, optimizer, n_joint, refine, n_beam: as in fit_astrometry_planets()/fit_rv_planets().
     c_funcs: gaiamock's compiled functions (read_in_C_functions(); read in automatically if None).
+    fixed: optional dict of parameters held fixed at the given values, keyed by <name>_<i>, where i is the index of
+        the planet in order of period (0 = shortest) and name is one of 'period', 'Tp', 'ecc', 'inc', 'Omega' (gaiamock units: days, radians), e.g.
+        {'period_0': 20.0, 'ecc_0': 0.0}. Needs n_planets or initial_planets. The planets are found as usual, then
+        polished with these values held fixed (in the linked model, then in the exact joint fit; with inc fixed, a0 starts from the value that keeps the fitted RV semi-amplitude). Fixed parameters have zero uncertainty, and are not counted as free
+        parameters. A fixed Tp fixes the phase phi_p = 2 pi Tp/P (which moves with P if P is free). For a circular
+        orbit (ecc fixed at 0), the phase and w are degenerate, so the phase is held fixed (at Tp if given, otherwise
+        at its best-fit value), and w carries the orbital phase. E.g. for a transiting planet whose astrometric signal is negligible, fix inc (pi/2)
+        and Omega (which then has no measurable effect). The result then includes fixed (the dict) and free_indices (the indices of the free
+        parameters in theta); see initial_walkers() and full_theta() for MCMC sampling of the free parameters.
 
     returns a dict with:
         n_planets, planets (sorted by period; each with period, ecc, phi_p, Tp, Omega, inc, inc_deg, w, a0_mas, K,
@@ -1427,7 +1681,8 @@ def fit_astrometry_and_rv_planets(t_ast_yr, psi, plx_factor, ast_obs, ast_err, t
         ra_off, dec_off, parallax, pmra, pmdec (and sig_*), gamma, sig_gamma, jitter,
         minus_2_ln_like, chi2, chi2_ast, chi2_rv, F2, uwe and uncertainty_scale (of the astrometry, as in gaiamock),
         linked_minus_2_ln_like, consistency_delta (= minus_2_ln_like - linked_minus_2_ln_like >= 0; it is large if the
-        astrometric and RV orbits disagree), chi2_history (linked -2 ln L for 0, 1, 2, ... planets), theta, theta_names,
+        astrometric and RV orbits disagree; roughly chi2 with 2 degrees of freedom per planet, plus one for each fixed
+        inc or Omega), chi2_history (linked -2 ln L for 0, 1, 2, ... planets), theta, theta_names,
         cov, model_planets, outlier_index, and in blind-search mode rejected_candidate and max_planets_searched.
     Notes: astrometric uncertainties are inflated by gaiamock's goodness-of-fit factor (uncertainty_scale); the
     uncertainty of the jitter is not propagated.
@@ -1446,8 +1701,12 @@ def fit_astrometry_and_rv_planets(t_ast_yr, psi, plx_factor, ast_obs, ast_err, t
         c_funcs = gaiamock.read_in_C_functions()
     settle = _settle_rv if fit_jitter else _settle_rv_fixed_jitter
     n_base = 5 + prob.n_sets*(2 if fit_jitter else 1)
+    fixed_input = fixed
+    fixed = _parse_fixed(fixed, n_planets, initial_planets, FIXABLE_PARAMETERS_JOINT, P_min, P_max, e_max)
+    if fixed is not None and eccentricity_prior is not None and any(f.get('ecc') == 0.0 for f in fixed.p):
+        raise ValueError('an eccentricity prior cannot be combined with an eccentricity fixed at 0.')
     sol, history, rejected, n_target, blind = _fit_planets(prob, n_planets, max_planets, delta_chi2_min, initial_planets, optimizer, n_joint,
-                                                           refine, n_beam, verbose, n_base, 9, settle)
+                                                           refine, n_beam, verbose, n_base, 9, settle, fixed=fixed)
     deltas = _leave_one_out(prob, sol, history, settle)
     linked = settle(prob, sol)[1]
     theta, model, stat = _refine_joint(prob, sol, c_funcs, fit_jitter)
@@ -1458,6 +1717,8 @@ def fit_astrometry_and_rv_planets(t_ast_yr, psi, plx_factor, ast_obs, ast_err, t
     result['consistency_delta'] = result['minus_2_ln_like'] - linked
     result['chi2_history'] = history
     result['fit_jitter'] = bool(fit_jitter)
+    if fixed is not None:
+        result['fixed'] = dict(fixed_input)
     if blind:
         result['rejected_candidate'] = rejected
         result['max_planets_searched'] = n_target
@@ -1580,12 +1841,17 @@ def initial_walkers(fit_result, nwalkers, log_prob=None, scatter=1e-3, include_j
     kept non-negative). Positions where log_prob (e.g. the user's log posterior, or just the log prior) is not finite
     are drawn again. Returns an array of shape (nwalkers, ndim); the parameter names are fit_result['theta_names'],
     followed by 'jitter_0', 'jitter_1', ... if the jitter is included.
+    If the fit had fixed parameters, the walkers contain only the free parameters (fit_result['theta_names'] at
+    fit_result['free_indices'], then the jitters), and log_prob is called with these: full_theta() returns the full
+    parameter vector that the likelihood functions need.
     rng: optional numpy Generator; if None, the global np.random state is used.
     '''
     rng = _get_rng(rng)
     theta = np.asarray(fit_result['theta'], dtype=np.float64)
     cov = np.asarray(fit_result['cov'], dtype=np.float64)
     sig = np.sqrt(np.abs(np.diag(cov))) if cov.shape == (len(theta), len(theta)) else np.full(len(theta), np.nan)
+    if fit_result.get('free_indices') is not None:
+        theta, sig = theta[fit_result['free_indices']], sig[fit_result['free_indices']]
     bad = ~np.isfinite(sig) | (sig == 0)
     sig[bad] = np.maximum(np.abs(theta[bad]), 1e-3) # no usable uncertainty: scatter relative to the value, as in gaiamock
     if include_jitter is None:
@@ -1605,3 +1871,24 @@ def initial_walkers(fit_result, nwalkers, log_prob=None, scatter=1e-3, include_j
                 return np.array(walkers)
     raise ValueError('Could not start %d walkers where log_prob is finite; check that log_prob is finite at the best fit, or use '
                      'a smaller scatter.' % nwalkers)
+
+def full_theta(theta_free, fit_result):
+    '''
+    The full parameter vector for the likelihood functions, from the free parameters of a fit with fixed parameters
+    (as returned by initial_walkers(), i.e. the parameters at fit_result['free_indices'], optionally followed by the
+    jitters): the fixed parameters are set to their values (and, with a fixed Tp, phi_p = 2 pi Tp/P). Without fixed
+    parameters, theta_free is returned unchanged.
+    '''
+    theta_free = np.asarray(theta_free, dtype=np.float64)
+    free = fit_result.get('free_indices')
+    if free is None:
+        return theta_free
+    theta = np.array(fit_result['theta'], dtype=np.float64)
+    theta[free] = theta_free[:len(free)]
+    names = list(fit_result['theta_names'])
+    for key, Tp in fit_result['fixed'].items():
+        name, _, i = key.rpartition('_')
+        if name == 'Tp':
+            P = theta[names.index('period_' + i)]
+            theta[names.index('phi_p_' + i)] = 2*np.pi*np.mod(float(Tp)/P, 1)
+    return np.concatenate([theta, theta_free[len(free):]])
