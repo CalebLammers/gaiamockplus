@@ -1,0 +1,16 @@
+# compiled C library (machine-specific; build locally, see README)
+*.so
+
+# large data downloaded separately (see README)
+healpix_scans/
+healpix_16_med_ruwe.npz
+
+# Python / Jupyter caches
+__pycache__/
+.ipynb_checkpoints/
+.DS_Store
+
+# packaging build products
+build/
+dist/
+*.egg-info/
