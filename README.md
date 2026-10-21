@@ -31,6 +31,7 @@ The example notebooks also need `emcee` and `corner` (`pip install emcee corner`
 - [03_single_planet_astrometry_and_rvs](notebooks/03_single_planet_astrometry_and_rvs.ipynb): RVs from three instruments, fit alone and jointly with the astrometry.
 - [04_two_planet_astrometry_and_rvs](notebooks/04_two_planet_astrometry_and_rvs.ipynb): two planets with astrometry and RVs, and their mutual inclination.
 - [05_transiting_planet_and_astrometric_giant](notebooks/05_transiting_planet_and_astrometric_giant.ipynb): a transiting planet, an astrometric giant, and their minimum mutual inclination.
+- [06_gaia4b_dr4_astrometry_and_rvs](notebooks/06_gaia4b_dr4_astrometry_and_rvs.ipynb): a joint fit of Gaia-4's RV datasets and pre-release epoch astrometry.
 
 ## Contact
 
