@@ -30,7 +30,7 @@ The example notebooks also need `emcee` and `corner` (`pip install emcee corner`
 - [02_two_planet_astrometry](notebooks/02_two_planet_astrometry.ipynb): a blind search for astrometric planets in a two-planet system.
 - [03_single_planet_astrometry_and_rvs](notebooks/03_single_planet_astrometry_and_rvs.ipynb): RVs from three instruments, fit alone and jointly with the astrometry.
 - [04_two_planet_astrometry_and_rvs](notebooks/04_two_planet_astrometry_and_rvs.ipynb): two planets with astrometry and RVs, and their mutual inclination.
-- [05_transiting_planet_and_astrometric_giant](notebooks/05_transiting_planet_and_astrometric_giant.ipynb): a transiting planet (with fixed parameters) and an astrometric giant, and their minimum mutual inclination.
+- [05_transiting_planet_and_astrometric_giant](notebooks/05_transiting_planet_and_astrometric_giant.ipynb): a transiting planet, an astrometric giant, and their minimum mutual inclination.
 
 ## Contact
 
