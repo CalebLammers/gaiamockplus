@@ -680,9 +680,9 @@ class _Problem:
         if rv is not None:
             self.t_rv, self.rv, self.rv_err, self.rv_set, self.n_sets = _rv_data(*rv)
             self.n_rv = len(self.rv)
-        else:
-            self.t_rv = self.rv = self.rv_err = _EMPTY_DBL
-            self.rv_set, self.n_sets, self.n_rv = _EMPTY_INT, 0, 0
+        else: # empty arrays (the compiled functions get placeholders instead: see _args())
+            self.t_rv = self.rv = self.rv_err = np.zeros(0)
+            self.rv_set, self.n_sets, self.n_rv = np.zeros(0, dtype=np.int32), 0, 0
         self.set_jitter(np.zeros(self.n_sets))
         self.plx_mu, self.plx_sig, self.ecc_a, self.ecc_b = _prior_args(parallax_prior, eccentricity_prior)
         self.reject = int(bool(reject_outlier))
@@ -701,12 +701,13 @@ class _Problem:
         if self.n_rv:
             self.rv_err_eff = np.ascontiguousarray(np.sqrt(self.rv_err**2 + self.jitter[self.rv_set]**2))
         else:
-            self.rv_err_eff = _EMPTY_DBL
+            self.rv_err_eff = np.zeros(0)
 
     def _args(self):
         ast = self.data if self.data is not None else [_EMPTY_DBL]*5
+        rv = (self.t_rv, self.rv, self.rv_err_eff, self.rv_set) if self.n_rv else (_EMPTY_DBL, _EMPTY_DBL, _EMPTY_DBL, _EMPTY_INT)
         skip = sum(1 << i for i in range(self.fixed.n) if self.fixed.rv_only(i)) if self.fixed is not None else 0
-        return (self.n, *ast, self.plx_mu, self.plx_sig, self.reject, self.n_rv, self.t_rv, self.rv, self.rv_err_eff, self.rv_set, self.n_sets, skip)
+        return (self.n, *ast, self.plx_mu, self.plx_sig, self.reject, self.n_rv, *rv, self.n_sets, skip)
 
     def chi2(self, P, phi, e):
         '''
@@ -1536,7 +1537,7 @@ def _joint_start(prob, sol):
             continue
         B, G, A, F = mu_ast[5 + 4*i: 9 + 4*i]
         a0, Omega, w, inc = gaiamock.get_Campbell_elements(A, B, F, G)
-        if abs(np.angle(np.exp(1j*(w - w_rv)))) > np.pi/2:
+        if prob.n_rv > 0 and abs(np.angle(np.exp(1j*(w - w_rv)))) > np.pi/2:
             Omega, w = Omega + np.pi, w + np.pi
         theta += [P[i], e[i], phi[i], Omega, inc, w, a0]
     return np.array(theta), worst
@@ -1709,7 +1710,7 @@ def _joint_fit_summary(model, theta, m_star, binned):
     result['model_planets'] = model_planets if m_star is not None else None
     return result
 
-def fit_astrometry_and_rv_planets(t_ast_yr, psi, plx_factor, ast_obs, ast_err, t_rvs_yr, rv, rv_err, rv_dataset=None, n_planets=None,
+def fit_astrometry_and_rv_planets(t_ast_yr, psi, plx_factor, ast_obs, ast_err, t_rvs_yr=None, rv=None, rv_err=None, rv_dataset=None, n_planets=None,
                                   max_planets=3, delta_chi2_min=None, m_star=None, P_min=10., P_max=1e4, e_max=0.99, parallax_prior=None,
                                   eccentricity_prior=None, reject_outlier=False, binned=True, fit_jitter=True, jitter=None, initial_planets=None,
                                   optimizer='periodogram_multistart', n_joint=3, refine=True, n_beam=1, verbose=False, c_funcs=None, c_funcs_plus=None,
@@ -1726,10 +1727,13 @@ def fit_astrometry_and_rv_planets(t_ast_yr, psi, plx_factor, ast_obs, ast_err, t
        astrometric orbit (the model of astrometry_and_rv_planets_model(), with w the star's argument of periastron and
        K = 2 pi a0 sin(inc)/(P sqrt(1 - e^2)), a0 in AU), alternating with the jitter fit. The systemic velocities are
        solved analytically. With RVs, Omega is determined in [0, 2 pi) (astrometry alone leaves Omega and Omega + pi).
+    Without RVs (t_rvs_yr, rv, rv_err None), this fits the astrometry alone (with the search of fit_astrometry_planets())
+    in the same physical parameters, e.g. for MCMC with the same parameters and priors as a joint fit; Omega and w are
+    then those of gaiamock's convention (Omega + pi, w + pi is an equally good solution).
 
     Arguments are as in fit_astrometry_planets() (astrometry and search settings) and fit_rv_planets() (RVs and jitter):
     t_ast_yr, psi, plx_factor, ast_obs, ast_err: epoch astrometry. t_rvs_yr, rv, rv_err, rv_dataset: RVs (km/s), with
-        times relative to the same reference epoch.
+        times relative to the same reference epoch (optional: see above).
     n_planets (known-N mode) or blind search (default) with max_planets and delta_chi2_min (applied to -2 ln L of the
         linked model); initial_planets: starting guesses (dicts with 'period', 'Tp', 'ecc') instead of a search.
     m_star: if given, planet masses and their uncertainties, and model_planets for astrometry_and_rv_planets_model().
@@ -1767,9 +1771,11 @@ def fit_astrometry_and_rv_planets(t_ast_yr, psi, plx_factor, ast_obs, ast_err, t
     Notes: astrometric uncertainties are inflated by gaiamock's goodness-of-fit factor (uncertainty_scale); the
     uncertainty of the jitter is not propagated.
     '''
-    prob = _Problem(ast=(t_ast_yr, psi, plx_factor, ast_obs, ast_err), rv=(t_rvs_yr, rv, rv_err, rv_dataset), parallax_prior=parallax_prior,
-                    eccentricity_prior=eccentricity_prior, reject_outlier=reject_outlier, P_min=P_min, P_max=P_max, e_max=e_max,
-                    c_funcs_plus=c_funcs_plus)
+    has_rv = t_rvs_yr is not None
+    prob = _Problem(ast=(t_ast_yr, psi, plx_factor, ast_obs, ast_err), rv=(t_rvs_yr, rv, rv_err, rv_dataset) if has_rv else None,
+                    parallax_prior=parallax_prior, eccentricity_prior=eccentricity_prior, reject_outlier=reject_outlier, P_min=P_min, P_max=P_max,
+                    e_max=e_max, c_funcs_plus=c_funcs_plus)
+    fit_jitter = bool(fit_jitter) and has_rv
     if eccentricity_prior is not None:
         _ecc_prior_offset(*eccentricity_prior) # check that the prior is supported
     if jitter is not None:
@@ -1779,7 +1785,7 @@ def fit_astrometry_and_rv_planets(t_ast_yr, psi, plx_factor, ast_obs, ast_err, t
         prob.set_jitter(jitter)
     if c_funcs is None:
         c_funcs = gaiamock.read_in_C_functions()
-    settle = _settle_rv if fit_jitter else _settle_rv_fixed_jitter
+    settle = _settle_rv if fit_jitter else (_settle_rv_fixed_jitter if has_rv else _settle_none)
     n_base = 5 + prob.n_sets*(2 if fit_jitter else 1)
     fixed_input = fixed
     fixed = _parse_fixed(fixed, n_planets, initial_planets, FIXABLE_PARAMETERS_JOINT, P_min, P_max, e_max)
@@ -1787,7 +1793,7 @@ def fit_astrometry_and_rv_planets(t_ast_yr, psi, plx_factor, ast_obs, ast_err, t
     if fixed is not None and eccentricity_prior is not None and any(f.get('ecc') == 0.0 for f in fixed.p):
         raise ValueError('an eccentricity prior cannot be combined with an eccentricity fixed at 0.')
     sol, history, rejected, n_target, blind = _fit_planets(prob, n_planets, max_planets, delta_chi2_min, initial_planets, optimizer, n_joint,
-                                                           refine, n_beam, verbose, n_base, 9, settle, fixed=fixed)
+                                                           refine, n_beam, verbose, n_base, 9 if has_rv else 7, settle, fixed=fixed)
     deltas = _leave_one_out(prob, sol, history, settle)
     linked = settle(prob, sol)[1]
     theta, model, stat = _refine_joint(prob, sol, c_funcs, fit_jitter)
@@ -1845,7 +1851,7 @@ def _split_jitter(theta, n_sets, jitter):
     '''theta without the jitter values, and the jitter (the last n_sets entries of theta if jitter is None).'''
     theta = np.asarray(theta, dtype=np.float64)
     if jitter is None:
-        return theta[:-n_sets], theta[-n_sets:]
+        return theta[:len(theta) - n_sets], theta[len(theta) - n_sets:]
     return theta, np.broadcast_to(np.asarray(jitter, dtype=np.float64), (n_sets,))
 
 def _ast_log_like(resid, reject_outlier, ast_err=None, ast_jitter=None):
@@ -1992,7 +1998,7 @@ def _joint_marginal(prob, model, phys, ast_jitter, reject_outlier, rng=None):
     lin = rng.multivariate_normal(mu, np.linalg.inv(G))
     return lnL, lin[[0, 2, 1, 3]], gamma + rng.normal(0, 1, prob.n_sets)/np.sqrt(sw)
 
-def log_likelihood_astrometry_and_rv_planets(theta, t_ast_yr, psi, plx_factor, ast_obs, ast_err, t_rvs_yr, rv, rv_err, rv_dataset=None,
+def log_likelihood_astrometry_and_rv_planets(theta, t_ast_yr, psi, plx_factor, ast_obs, ast_err, t_rvs_yr=None, rv=None, rv_err=None, rv_dataset=None,
                                              jitter=None, reject_outlier=False, fit_ast_jitter=False, c_funcs=None, c_funcs_plus=None, rv_only=None,
                                              marginalize=True):
     '''
@@ -2011,8 +2017,16 @@ def log_likelihood_astrometry_and_rv_planets(theta, t_ast_yr, psi, plx_factor, a
         log_likelihood_astrometry_planets().
     rv_only: indices of the planets without astrometric signal (as in the fit: fit_result['rv_only']); their Omega
         is ignored, and they enter the RVs only.
+    Without RVs (t_rvs_yr, rv, rv_err None), the likelihood of the astrometry alone in the same physical parameters (as
+        fit_astrometry_and_rv_planets() without RVs): with marginalize=True, only the position offsets and proper motion
+        are integrated out, unlike log_likelihood_astrometry_planets(), which also integrates out the Thiele-Innes
+        elements (with flat priors on them, which are not flat priors on a0, Omega, inc and w).
     '''
-    t, rv, rv_err, sets, n_sets = _rv_data(t_rvs_yr, rv, rv_err, rv_dataset)
+    if t_rvs_yr is not None:
+        t, rv, rv_err, sets, n_sets = _rv_data(t_rvs_yr, rv, rv_err, rv_dataset)
+        rv_arg = (t, rv, rv_err, sets)
+    else:
+        rv_arg, n_sets = None, 0
     theta = np.asarray(theta, dtype=np.float64)
     ast_jitter = None
     if fit_ast_jitter:
@@ -2032,7 +2046,7 @@ def log_likelihood_astrometry_and_rv_planets(theta, t_ast_yr, psi, plx_factor, a
         phys, gamma = theta[:5 + 7*n_pl], theta[5 + 7*n_pl:]
     if not _orbits_valid(phys[5::7], phys[6::7]) or not np.all(jit >= 0) or not phys[2] > 0:
         return -np.inf
-    prob = _Problem(ast=(t_ast_yr, psi, plx_factor, ast_obs, ast_err), rv=(t, rv, rv_err, sets), c_funcs_plus=c_funcs_plus)
+    prob = _Problem(ast=(t_ast_yr, psi, plx_factor, ast_obs, ast_err), rv=rv_arg, c_funcs_plus=c_funcs_plus)
     prob.set_jitter(jit)
     flags = [i in set(rv_only or ()) for i in range(n_pl)]
     model = _JointModel(prob, _get_c_funcs(c_funcs), np.ones(prob.n, dtype=bool), rv_only=flags)
@@ -2167,6 +2181,10 @@ def expand_marginal_samples(samples, fit_result=None, ast_data=None, rv_data=Non
     full_theta() if the fit had fixed parameters): for each sample, the linear parameters (see the marginalize option
     of the likelihood functions) are drawn from their conditional posterior, which is Gaussian. Returns an array with
     one row per sample, ordered as fit_result['theta'], followed by the jitters and the astrometric jitter of the input.
+    The samples are those of log_likelihood_astrometry_and_rv_planets() if rv_data is given, or if ast_data alone is given
+    with the parameters of a fit_astrometry_and_rv_planets() fit without RVs (or, without fit_result, rows of
+    1 + 7 n_planets entries, plus the astrometric jitter); otherwise those of log_likelihood_astrometry_planets() (with
+    ast_data) or log_likelihood_rv_planets() (with rv_data).
     fit_result: the fit whose theta defines the parameters (from fit_astrometry_planets(), fit_rv_planets() or
         fit_astrometry_and_rv_planets()); or None, with n_planets the number of planets (e.g. for samples from a
         sampler started without a fit, such as nested sampling). ast_data = (t_ast_yr, psi, plx_factor, ast_obs, ast_err) and/or
@@ -2178,7 +2196,11 @@ def expand_marginal_samples(samples, fit_result=None, ast_data=None, rv_data=Non
     if fit_result is None and n_planets is None:
         raise ValueError('give fit_result or n_planets.')
     n_pl = fit_result['n_planets'] if fit_result is not None else int(n_planets)
-    if ast_data is not None and rv_data is not None:
+    if fit_result is not None:
+        physical = any(n.startswith('a0_mas_') for n in fit_result['theta_names'])
+    else:
+        physical = samples.shape[1] - int(bool(fit_ast_jitter)) == 1 + 7*n_pl
+    if ast_data is not None and (rv_data is not None or physical):
         kind = 'joint'
     elif ast_data is not None:
         kind = 'astrometry'
@@ -2217,8 +2239,9 @@ def expand_marginal_samples(samples, fit_result=None, ast_data=None, rv_data=Non
                 theta += [*core[3*i: 3*i + 3], *lin[n_sets + 2*i: n_sets + 2*i + 2]]
         else:
             core, extra = y[:1 + 7*n_pl], y[1 + 7*n_pl:]
-            jit = extra if jitter is None else np.broadcast_to(np.asarray(jitter, dtype=np.float64), (n_sets,))
-            prob = _Problem(ast=ast_data, rv=(t_rv, rv, rv_err, sets), c_funcs_plus=c_funcs_plus)
+            n_s = n_sets if rv_data is not None else 0
+            jit = extra if jitter is None else np.broadcast_to(np.asarray(jitter, dtype=np.float64), (n_s,))
+            prob = _Problem(ast=ast_data, rv=(t_rv, rv, rv_err, sets) if rv_data is not None else None, c_funcs_plus=c_funcs_plus)
             prob.set_jitter(jit)
             flags = [i in set(rv_only or ()) for i in range(n_pl)]
             model = _JointModel(prob, _get_c_funcs(c_funcs), np.ones(prob.n, dtype=bool), rv_only=flags)
