@@ -2160,22 +2160,24 @@ def full_theta(theta_free, fit_result, marginalize=True):
             theta[names.index('phi_p_' + i)] = 2*np.pi*np.mod(float(Tp)/P, 1)
     return np.concatenate([theta[keep], theta_free[len(sampled):]])
 
-def expand_marginal_samples(samples, fit_result, ast_data=None, rv_data=None, rv_dataset=None, jitter=None, fit_ast_jitter=False,
-                            reject_outlier=False, rv_only=None, rng=None, c_funcs=None, c_funcs_plus=None):
+def expand_marginal_samples(samples, fit_result=None, ast_data=None, rv_data=None, rv_dataset=None, jitter=None, fit_ast_jitter=False,
+                            reject_outlier=False, rv_only=None, rng=None, c_funcs=None, c_funcs_plus=None, n_planets=None):
     '''
     Samples of all parameters, from samples of the likelihood functions' parameters with marginalize=True (after
     full_theta() if the fit had fixed parameters): for each sample, the linear parameters (see the marginalize option
     of the likelihood functions) are drawn from their conditional posterior, which is Gaussian. Returns an array with
     one row per sample, ordered as fit_result['theta'], followed by the jitters and the astrometric jitter of the input.
     fit_result: the fit whose theta defines the parameters (from fit_astrometry_planets(), fit_rv_planets() or
-        fit_astrometry_and_rv_planets()). ast_data = (t_ast_yr, psi, plx_factor, ast_obs, ast_err) and/or
+        fit_astrometry_and_rv_planets()); or None, with n_planets the number of planets (e.g. for samples from a
+        sampler started without a fit, such as nested sampling). ast_data = (t_ast_yr, psi, plx_factor, ast_obs, ast_err) and/or
         rv_data = (t_rvs_yr, rv, rv_err), with rv_dataset, jitter, fit_ast_jitter, reject_outlier and rv_only (default:
-        fit_result['rv_only']) as given to the likelihood function.
+        fit_result['rv_only'] if fit_result is given) as given to the likelihood function.
     '''
     rng = _get_rng(rng)
     samples = np.atleast_2d(np.asarray(samples, dtype=np.float64))
-    names = list(fit_result['theta_names'])
-    n_pl = fit_result['n_planets']
+    if fit_result is None and n_planets is None:
+        raise ValueError('give fit_result or n_planets.')
+    n_pl = fit_result['n_planets'] if fit_result is not None else int(n_planets)
     if ast_data is not None and rv_data is not None:
         kind = 'joint'
     elif ast_data is not None:
@@ -2184,7 +2186,7 @@ def expand_marginal_samples(samples, fit_result, ast_data=None, rv_data=None, rv
         kind = 'rv'
     else:
         raise ValueError('give ast_data and/or rv_data.')
-    if kind == 'joint' and rv_only is None:
+    if kind == 'joint' and rv_only is None and fit_result is not None:
         rv_only = fit_result.get('rv_only')
     if rv_data is not None:
         t_rv, rv, rv_err, sets, n_sets = _rv_data(*rv_data, rv_dataset)
