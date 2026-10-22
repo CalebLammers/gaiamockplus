@@ -390,9 +390,11 @@ def read_in_C_functions_plus():
     lib.gmp_polish.argtypes = data + [c_int, dbl, dbl, dbl, intp, dbl, dbl, c_dbl, c_dbl, c_int, c_dbl, c_dbl, c_int, c_int, dbl]
     lib.gmp_multistart.argtypes = data + [c_int, dbl, dbl, dbl, dbl, dbl, c_dbl, c_dbl, c_int, c_int, c_int, c_int, c_int, c_int, c_int, dbl, intp]
     lib.gmp_anneal.argtypes = data + [c_int, dbl, dbl, dbl, dbl, dbl, c_dbl, c_dbl, ctypes.c_uint, dbl]
+    lib.gmp_marginal.argtypes = data + [c_int, dbl, dbl, dbl, c_int, dbl, dbl, dbl, dbl, dbl]
     lib.gmp_astrometry_residuals.argtypes = [c_int, dbl, dbl, dbl, dbl, dbl, c_int, dbl, dbl]
     lib.gmp_rv_residuals.argtypes = [c_int, dbl, dbl, dbl, intp, c_int, c_int, dbl, dbl]
-    for name in ('gmp_chi2', 'gmp_periodogram', 'gmp_scan', 'gmp_polish', 'gmp_multistart', 'gmp_anneal', 'gmp_astrometry_residuals', 'gmp_rv_residuals'):
+    for name in ('gmp_chi2', 'gmp_marginal', 'gmp_periodogram', 'gmp_scan', 'gmp_polish', 'gmp_multistart', 'gmp_anneal', 'gmp_astrometry_residuals',
+                 'gmp_rv_residuals'):
         getattr(lib, name).restype = None
     return lib
 
@@ -715,6 +717,22 @@ class _Problem:
         out, mu_ast, mu_rv = np.zeros(4), np.zeros(5 + 4*len(P)), np.zeros(self.n_sets + 2*len(P))
         self.lib.gmp_chi2(*self._args(), len(P), P, phi, e, out, mu_ast, mu_rv)
         return out[0] + out[1] + out[2], mu_ast, int(out[3]), mu_rv
+
+    def marginal(self, P, phi, e, want_cov=False):
+        '''
+        For the likelihood marginalized over the linear parameters (see gmp_marginal() in kepler_solve_planets.c): out =
+        (astrometric chi2 at the best linear parameters, ln det of its normal matrix, index of the rejected epoch (-1 if
+        none), RV chi2, ln det of its normal matrix), the best astrometric and RV linear parameters (in the order of
+        chi2()), and, if want_cov, their covariance matrices (else None).
+        '''
+        P, phi, e = _nonlinear_arrays(P, phi, e)
+        n_a, n_r = 5 + 4*len(P), self.n_sets + 2*len(P)
+        out, mu_ast, mu_rv = np.zeros(5), np.zeros(n_a), np.zeros(n_r)
+        cov_ast, cov_rv = (np.zeros(n_a*n_a), np.zeros(n_r*n_r)) if want_cov else (_EMPTY_DBL, _EMPTY_DBL)
+        self.lib.gmp_marginal(*self._args(), len(P), P, phi, e, int(bool(want_cov)), out, mu_ast, cov_ast, mu_rv, cov_rv)
+        if want_cov:
+            return out, mu_ast, cov_ast.reshape(n_a, n_a), mu_rv, cov_rv.reshape(n_r, n_r)
+        return out, mu_ast, None, mu_rv, None
 
     def minus_2_ln_like(self, chi2):
         '''-2 ln(likelihood) up to a constant: chi2 + sum of ln(2 pi sigma^2) of the RVs, which depends on the jitter.'''
@@ -1800,6 +1818,14 @@ def fit_astrometry_and_rv_planets(t_ast_yr, psi, plx_factor, ast_obs, ast_err, t
 # swapping planets.
 # These posteriors are often strongly correlated (e.g. phi_p with the Thiele-Innes elements), so chains must be long:
 # check the autocorrelation time (e.g. emcee's get_autocorr_time()).
+# By default (marginalize=True), the parameters on which the model depends linearly are integrated out of the likelihood
+# analytically, with flat priors: theta then holds only the other parameters (see _linear_mask()), which makes the
+# posterior lower-dimensional and less correlated, so MCMC converges faster. The posterior of the remaining parameters is
+# exactly that of the full likelihood with flat priors on the linear ones (and the volume term ln det of the normal
+# matrix makes this the marginal, not the profile, likelihood). expand_marginal_samples() then draws the linear
+# parameters from their (Gaussian) conditional posterior, giving samples of the full parameter vector.
+# The likelihood is periodic in the angles phi_p, Omega and w, so bound them in the prior (e.g. within pi of the best
+# fit, one period): otherwise the walkers can drift apart by multiples of 2 pi, which stalls the chain.
 
 _C_FUNCS_GAIAMOCK = None
 
@@ -1845,13 +1871,19 @@ def _rv_log_like(resid, sig):
     return -0.5*(np.sum(resid**2) + np.sum(np.log(2*np.pi*sig**2)))
 
 def log_likelihood_astrometry_planets(theta, t_ast_yr, psi, plx_factor, ast_obs, ast_err, reject_outlier=False, fit_ast_jitter=False,
-                                      c_funcs_plus=None):
+                                      c_funcs_plus=None, marginalize=True):
     '''
-    ln L = -chi2/2 of epoch astrometry for N planets (no priors), with theta ordered as the 'theta' of
-    fit_astrometry_planets(): (ra_off, dec_off, parallax, pmra, pmdec, then for each planet: period, ecc, phi_p, A,
-    B, F, G), in the units of gaiamock (mas, mas/yr, days, radians). For one planet this is gaiamock's 12-parameter
-    solution (as in gaiamock.mcmc_fit_with_thiele_innes_elements()). N is set by the length of theta.
-    reject_outlier: if True, the epoch with the largest residual is ignored, as in gaiamock.
+    ln L of epoch astrometry for N planets (no priors), in the units of gaiamock (mas, mas/yr, days, radians).
+    marginalize: if True (default), the 5 + 4N linear parameters (position offsets, parallax, proper motion, and the
+        Thiele-Innes elements A, B, F, G of each planet) are integrated out analytically, with flat priors, and theta
+        holds the nonlinear parameters: (period, ecc, phi_p) for each planet. ln L = -chi2_min/2 + (k/2) ln(2 pi) -
+        ln det(M^T W M)/2, with chi2_min the chi2 at the best linear parameters, k = 5 + 4N, and M the design matrix.
+        Use expand_marginal_samples() for samples of all parameters.
+        If False, theta is ordered as the 'theta' of fit_astrometry_planets(): (ra_off, dec_off, parallax, pmra, pmdec,
+        then for each planet: period, ecc, phi_p, A, B, F, G), and ln L = -chi2/2; for one planet this is gaiamock's
+        12-parameter solution (as in gaiamock.mcmc_fit_with_thiele_innes_elements()). N is set by the length of theta.
+    reject_outlier: if True, the epoch with the largest residual is ignored, as in gaiamock (with marginalize, the epoch
+        with the largest residual of the best linear solution, as in the fitting functions).
     fit_ast_jitter: if True, the last entry of theta is an astrometric jitter s (mas, >= 0), added in quadrature to
         ast_err: unmodeled noise, which real Gaia epoch astrometry (and gaiamock's simulations, for G < 13) contains.
         ln L then includes the normalization: -(sum of r^2/sigma^2 + ln(2 pi sigma^2))/2, with sigma^2 = ast_err^2 + s^2
@@ -1863,6 +1895,24 @@ def log_likelihood_astrometry_planets(theta, t_ast_yr, psi, plx_factor, ast_obs,
         theta, ast_jitter = theta[:-1], theta[-1]
         if not ast_jitter >= 0:
             return -np.inf
+    if marginalize:
+        n_pl = len(theta)//3
+        if len(theta) != 3*n_pl:
+            raise ValueError('with marginalize=True, theta must have 3 N entries (period, ecc, phi_p for each planet), plus the jitter.')
+        if not _orbits_valid(theta[0::3], theta[1::3]):
+            return -np.inf
+        err = np.asarray(ast_err, dtype=np.float64)
+        sig = err if ast_jitter is None else np.sqrt(err**2 + ast_jitter**2)
+        prob = _Problem(ast=(t_ast_yr, psi, plx_factor, ast_obs, sig), reject_outlier=reject_outlier, P_min=1e-10, P_max=np.inf,
+                        c_funcs_plus=c_funcs_plus)
+        out = prob.marginal(theta[0::3], theta[2::3], theta[1::3])[0]
+        lnL = -0.5*out[0] + 0.5*(5 + 4*n_pl)*np.log(2*np.pi) - 0.5*out[1]
+        if ast_jitter is not None:
+            used = np.ones(len(sig), dtype=bool)
+            if out[2] >= 0:
+                used[int(out[2])] = False
+            lnL -= 0.5*np.sum(np.log(2*np.pi*sig[used]**2))
+        return lnL if np.isfinite(lnL) else -np.inf
     n_pl = (len(theta) - 5)//7
     if len(theta) != 5 + 7*n_pl:
         raise ValueError('theta must have 5 + 7 N entries.')
@@ -1872,34 +1922,91 @@ def log_likelihood_astrometry_planets(theta, t_ast_yr, psi, plx_factor, ast_obs,
     lnL = _ast_log_like(prob.residuals(theta, n_pl), reject_outlier, prob.data[4], ast_jitter)
     return lnL if np.isfinite(lnL) else -np.inf
 
-def log_likelihood_rv_planets(theta, t_rvs_yr, rv, rv_err, rv_dataset=None, jitter=None, c_funcs_plus=None):
+def log_likelihood_rv_planets(theta, t_rvs_yr, rv, rv_err, rv_dataset=None, jitter=None, c_funcs_plus=None, marginalize=True):
     '''
     ln L of RVs for N planets (no priors), -(chi2 + sum of ln(2 pi sigma^2))/2 with sigma^2 = rv_err^2 + jitter^2 of each
-    RV's dataset, and theta ordered as the 'theta' of fit_rv_planets(): (gamma for each RV dataset, then for each
-    planet: period, ecc, phi_p, K_cos_w, K_sin_w; km/s, days, radians), followed by the jitter of each dataset (km/s)
-    unless jitter is given (then fixed at those values). N is set by the length of theta.
+    RV's dataset (km/s, days, radians), followed in theta by the jitter of each dataset (km/s) unless jitter is given
+    (then fixed at those values). N is set by the length of theta.
+    marginalize: if True (default), the n_sets + 2N linear parameters (the systemic velocity of each dataset, and
+        K cos(w), K sin(w) of each planet) are integrated out analytically, with flat priors, and theta holds (period,
+        ecc, phi_p) for each planet, then the jitters; ln L gains the volume term (k/2) ln(2 pi) - ln det(M^T W M)/2
+        (see log_likelihood_astrometry_planets()). Use expand_marginal_samples() for samples of all parameters.
+        If False, theta is ordered as the 'theta' of fit_rv_planets(): (gamma for each RV dataset, then for each planet:
+        period, ecc, phi_p, K_cos_w, K_sin_w), then the jitters.
     '''
     t, rv, rv_err, sets, n_sets = _rv_data(t_rvs_yr, rv, rv_err, rv_dataset)
     theta, jit = _split_jitter(theta, n_sets, jitter)
+    if not np.all(jit >= 0):
+        return -np.inf
+    prob = _Problem(rv=(t, rv, rv_err, sets), P_min=1e-10, P_max=np.inf, c_funcs_plus=c_funcs_plus)
+    prob.set_jitter(jit)
+    if marginalize:
+        n_pl = len(theta)//3
+        if len(theta) != 3*n_pl:
+            raise ValueError('with marginalize=True, theta must have 3 N entries (period, ecc, phi_p for each planet), plus n_sets jitter values if jitter is None.')
+        if not _orbits_valid(theta[0::3], theta[1::3]):
+            return -np.inf
+        out = prob.marginal(theta[0::3], theta[2::3], theta[1::3])[0]
+        lnL = (-0.5*(out[3] + np.sum(np.log(2*np.pi*prob.rv_err_eff**2))) + 0.5*(n_sets + 2*n_pl)*np.log(2*np.pi) - 0.5*out[4])
+        return lnL if np.isfinite(lnL) else -np.inf
     n_pl = (len(theta) - n_sets)//5
     if len(theta) != n_sets + 5*n_pl:
         raise ValueError('theta must have n_sets + 5 N entries (plus n_sets jitter values if jitter is None).')
-    if not _orbits_valid(theta[n_sets::5], theta[n_sets + 1::5]) or not np.all(jit >= 0):
+    if not _orbits_valid(theta[n_sets::5], theta[n_sets + 1::5]):
         return -np.inf
-    prob = _Problem(rv=(t, rv, rv_err, sets), c_funcs_plus=c_funcs_plus)
-    prob.set_jitter(jit)
     lnL = _rv_log_like(prob.rv_residuals(theta, n_pl), prob.rv_err_eff)
     return lnL if np.isfinite(lnL) else -np.inf
 
+def _joint_marginal(prob, model, phys, ast_jitter, reject_outlier, rng=None):
+    '''
+    The joint ln L with the position offsets, proper motion and systemic velocities integrated out (flat priors), for the
+    physical parameters phys (5 + 7N; the entries of the linear parameters are ignored). The astrometry is linear in
+    (ra_off, pmra, dec_off, pmdec), with columns sin(psi), t sin(psi), cos(psi), t cos(psi), and each RV dataset in its
+    systemic velocity. If rng is given, also returns a draw of these parameters from their conditional posterior:
+    (ra_off, dec_off, pmra, pmdec) and gamma.
+    '''
+    t, psi, err, obs = prob.data[0], prob.data[1], prob.data[4], prob.data[3]
+    phys = np.array(phys, dtype=np.float64)
+    phys[[0, 1, 3, 4]] = 0.0
+    ast, rv_pl = model.signals(phys)
+    X = np.column_stack([np.sin(psi), t*np.sin(psi), np.cos(psi), t*np.cos(psi)])
+    sig2 = err**2 if ast_jitter is None else err**2 + ast_jitter**2
+    w, r = 1/sig2, obs - ast
+    used = np.ones(len(r), dtype=bool)
+    for attempt in range(2 if reject_outlier else 1):
+        G = X[used].T @ (X[used]*w[used, None])
+        mu = np.linalg.solve(G, X[used].T @ (w[used]*r[used]))
+        z2 = w*(r - X @ mu)**2
+        if reject_outlier and attempt == 0:
+            used[np.argmax(z2)] = False
+    lnL = -0.5*np.sum(z2[used]) + 2*np.log(2*np.pi) - 0.5*np.linalg.slogdet(G)[1]
+    if ast_jitter is not None:
+        lnL -= 0.5*np.sum(np.log(2*np.pi*sig2[used]))
+    wr, rr = 1/prob.rv_err_eff**2, prob.rv - rv_pl
+    sw = np.bincount(prob.rv_set, wr, minlength=prob.n_sets)
+    gamma = np.bincount(prob.rv_set, wr*rr, minlength=prob.n_sets)/sw
+    lnL += (-0.5*(np.sum(wr*(rr - gamma[prob.rv_set])**2) + np.sum(np.log(2*np.pi/wr))) + 0.5*prob.n_sets*np.log(2*np.pi)
+            - 0.5*np.sum(np.log(sw)))
+    if rng is None:
+        return lnL
+    lin = rng.multivariate_normal(mu, np.linalg.inv(G))
+    return lnL, lin[[0, 2, 1, 3]], gamma + rng.normal(0, 1, prob.n_sets)/np.sqrt(sw)
+
 def log_likelihood_astrometry_and_rv_planets(theta, t_ast_yr, psi, plx_factor, ast_obs, ast_err, t_rvs_yr, rv, rv_err, rv_dataset=None,
-                                             jitter=None, reject_outlier=False, fit_ast_jitter=False, c_funcs=None, c_funcs_plus=None, rv_only=None):
+                                             jitter=None, reject_outlier=False, fit_ast_jitter=False, c_funcs=None, c_funcs_plus=None, rv_only=None,
+                                             marginalize=True):
     '''
     ln L of epoch astrometry and RVs for N planets (no priors): the sum of log_likelihood_astrometry_planets() and
-    log_likelihood_rv_planets() for the same orbits, with theta ordered as the 'theta' of
-    fit_astrometry_and_rv_planets(): (ra_off, dec_off, parallax, pmra, pmdec, then for each planet: period, ecc,
-    phi_p, Omega, inc, w, a0_mas, then gamma for each RV dataset), followed by the jitter of each dataset (km/s)
-    unless jitter is given (then fixed at those values). Angles in radians; the conventions are those of
+    log_likelihood_rv_planets() for the same orbits, followed in theta by the jitter of each dataset (km/s) unless
+    jitter is given (then fixed at those values). Angles in radians; the conventions are those of
     astrometry_and_rv_planets_model() (K follows from a0, parallax, inc, P and e). N is set by the length of theta.
+    marginalize: if True (default), the position offsets, proper motion and the systemic velocity of each dataset (on
+        which the model depends linearly) are integrated out analytically, with flat priors, and theta holds (parallax,
+        then for each planet: period, ecc, phi_p, Omega, inc, w, a0_mas), then the jitters; ln L gains the volume terms
+        (see log_likelihood_astrometry_planets()). The parallax is kept, since it also sets the RV semi-amplitude. Use
+        expand_marginal_samples() for samples of all parameters.
+        If False, theta is ordered as the 'theta' of fit_astrometry_and_rv_planets(): (ra_off, dec_off, parallax, pmra,
+        pmdec, then the 7 parameters of each planet, then gamma for each RV dataset), then the jitters.
     fit_ast_jitter: if True, the last entry of theta (after the RV jitters) is an astrometric jitter, as in
         log_likelihood_astrometry_planets().
     rv_only: indices of the planets without astrometric signal (as in the fit: fit_result['rv_only']); their Omega
@@ -1913,16 +2020,26 @@ def log_likelihood_astrometry_and_rv_planets(theta, t_ast_yr, psi, plx_factor, a
         if not ast_jitter >= 0:
             return -np.inf
     theta, jit = _split_jitter(theta, n_sets, jitter)
-    n_pl = (len(theta) - 5 - n_sets)//7
-    if len(theta) != 5 + 7*n_pl + n_sets:
-        raise ValueError('theta must have 5 + 7 N + n_sets entries (plus n_sets jitter values if jitter is None).')
-    phys, gamma = theta[:5 + 7*n_pl], theta[5 + 7*n_pl:]
+    if marginalize:
+        n_pl = (len(theta) - 1)//7
+        if len(theta) != 1 + 7*n_pl:
+            raise ValueError('with marginalize=True, theta must have 1 + 7 N entries (parallax, then 7 per planet), plus the jitters.')
+        phys = np.concatenate([[0.0, 0.0, theta[0], 0.0, 0.0], theta[1:]])
+    else:
+        n_pl = (len(theta) - 5 - n_sets)//7
+        if len(theta) != 5 + 7*n_pl + n_sets:
+            raise ValueError('theta must have 5 + 7 N + n_sets entries (plus n_sets jitter values if jitter is None).')
+        phys, gamma = theta[:5 + 7*n_pl], theta[5 + 7*n_pl:]
     if not _orbits_valid(phys[5::7], phys[6::7]) or not np.all(jit >= 0) or not phys[2] > 0:
         return -np.inf
     prob = _Problem(ast=(t_ast_yr, psi, plx_factor, ast_obs, ast_err), rv=(t, rv, rv_err, sets), c_funcs_plus=c_funcs_plus)
     prob.set_jitter(jit)
     flags = [i in set(rv_only or ()) for i in range(n_pl)]
-    resid = _JointModel(prob, _get_c_funcs(c_funcs), np.ones(prob.n, dtype=bool), rv_only=flags).residuals(phys, gamma=gamma)
+    model = _JointModel(prob, _get_c_funcs(c_funcs), np.ones(prob.n, dtype=bool), rv_only=flags)
+    if marginalize:
+        lnL = _joint_marginal(prob, model, phys, ast_jitter, reject_outlier)
+        return lnL if np.isfinite(lnL) else -np.inf
+    resid = model.residuals(phys, gamma=gamma)
     lnL = _ast_log_like(resid[:prob.n], reject_outlier, prob.data[4], ast_jitter) + _rv_log_like(resid[prob.n:prob.n + prob.n_rv], prob.rv_err_eff)
     return lnL if np.isfinite(lnL) else -np.inf
 
@@ -1944,7 +2061,29 @@ def estimate_astrometric_jitter(fit_result, ast_err):
     ast_err = np.asarray(ast_err, dtype=np.float64)
     return float(np.sqrt(max(chi2/nu - 1, 0.0)*np.mean(ast_err**2)))
 
-def initial_walkers(fit_result, nwalkers, log_prob=None, scatter=1e-3, include_jitter=None, ast_jitter=None, rng=None):
+def _linear_mask(fit_result):
+    '''
+    Mask of the linear parameters in fit_result['theta'], which the likelihood functions integrate out with
+    marginalize=True: the position offsets and proper motion, the systemic velocities, each planet's Thiele-Innes
+    elements (astrometry) or K cos(w), K sin(w) (RVs), and, in astrometry-only fits, the parallax.
+    '''
+    names = list(fit_result['theta_names'])
+    joint = any(n.startswith('a0_mas_') for n in names)
+    linear = {'ra_off', 'dec_off', 'pmra', 'pmdec'} | (set() if joint else {'parallax'})
+    return np.array([n in linear or n.split('_')[0] in ('A', 'B', 'F', 'G', 'gamma') or n.startswith(('K_cos_w_', 'K_sin_w_')) for n in names])
+
+def _sampled_indices(fit_result, marginalize):
+    '''indices (in fit_result['theta']) of the parameters that the walkers sample: without the linear ones if marginalize,
+    and without the fixed ones'''
+    keep = ~_linear_mask(fit_result) if marginalize else np.ones(len(fit_result['theta']), dtype=bool)
+    free = fit_result.get('free_indices')
+    if free is not None:
+        is_free = np.zeros(len(keep), dtype=bool)
+        is_free[np.asarray(free, dtype=int)] = True
+        keep &= is_free
+    return np.where(keep)[0]
+
+def initial_walkers(fit_result, nwalkers, log_prob=None, scatter=1e-3, include_jitter=None, ast_jitter=None, rng=None, marginalize=True):
     '''
     Starting positions for MCMC walkers in a small ball around the best fit of fit_astrometry_planets(),
     fit_rv_planets() or fit_astrometry_and_rv_planets(): theta + scatter * sigma * N(0, 1) for each parameter, where
@@ -1952,11 +2091,14 @@ def initial_walkers(fit_result, nwalkers, log_prob=None, scatter=1e-3, include_j
     parameter. If include_jitter (default: if the jitter was fit), the jitter of each RV dataset is appended to theta,
     as the likelihood functions expect (scattered by scatter * jitter, or by scatter * 1 m/s if the jitter is 0, and
     kept non-negative). Positions where log_prob (e.g. the user's log posterior, or just the log prior) is not finite
-    are drawn again. Returns an array of shape (nwalkers, ndim); the parameter names are fit_result['theta_names'],
-    followed by 'jitter_0', 'jitter_1', ... if the jitter is included.
-    If the fit had fixed parameters, the walkers contain only the free parameters (fit_result['theta_names'] at
-    fit_result['free_indices'], then the jitters), and log_prob is called with these: full_theta() returns the full
-    parameter vector that the likelihood functions need.
+    are drawn again. Returns an array of shape (nwalkers, ndim).
+    marginalize: if True (default), the walkers contain only the parameters that the likelihood functions sample with
+        marginalize=True (fit_result['theta'] without its linear parameters), as the likelihood functions expect by
+        default; if False, all of fit_result['theta'].
+    If the fit had fixed parameters, the walkers contain only the free parameters (of these), then the jitters, and
+    log_prob is called with these: full_theta() returns the parameter vector that the likelihood functions need.
+    The names of the walkers' parameters are those of fit_result['theta_names'] at sampled_names(fit_result), then
+    'jitter_0', 'jitter_1', ... if the jitter is included.
     ast_jitter: if given (mas, e.g. from estimate_astrometric_jitter()), an astrometric jitter is appended as the last
     parameter (scattered by scatter * ast_jitter, or by scatter * 0.01 mas if it is 0, and kept non-negative), as the
     likelihood functions expect with fit_ast_jitter=True.
@@ -1966,8 +2108,8 @@ def initial_walkers(fit_result, nwalkers, log_prob=None, scatter=1e-3, include_j
     theta = np.asarray(fit_result['theta'], dtype=np.float64)
     cov = np.asarray(fit_result['cov'], dtype=np.float64)
     sig = np.sqrt(np.abs(np.diag(cov))) if cov.shape == (len(theta), len(theta)) else np.full(len(theta), np.nan)
-    if fit_result.get('free_indices') is not None:
-        theta, sig = theta[fit_result['free_indices']], sig[fit_result['free_indices']]
+    idx = _sampled_indices(fit_result, marginalize)
+    theta, sig = theta[idx], sig[idx]
     bad = ~np.isfinite(sig) | (sig == 0)
     sig[bad] = np.maximum(np.abs(theta[bad]), 1e-3) # no usable uncertainty: scatter relative to the value, as in gaiamock
     if include_jitter is None:
@@ -1991,23 +2133,95 @@ def initial_walkers(fit_result, nwalkers, log_prob=None, scatter=1e-3, include_j
     raise ValueError('Could not start %d walkers where log_prob is finite; check that log_prob is finite at the best fit, or use '
                      'a smaller scatter.' % nwalkers)
 
-def full_theta(theta_free, fit_result):
+def sampled_names(fit_result, marginalize=True):
+    '''The names of the parameters of fit_result['theta'] that the walkers of initial_walkers() sample (before the jitters).'''
+    return [fit_result['theta_names'][k] for k in _sampled_indices(fit_result, marginalize)]
+
+def full_theta(theta_free, fit_result, marginalize=True):
     '''
-    The full parameter vector for the likelihood functions, from the free parameters of a fit with fixed parameters
-    (as returned by initial_walkers(), i.e. the parameters at fit_result['free_indices'], optionally followed by the
-    jitters, and the astrometric jitter): the fixed parameters are set to their values (and, with a fixed Tp, phi_p = 2 pi Tp/P). Without fixed
-    parameters, theta_free is returned unchanged.
+    The parameter vector for the likelihood functions, from the walkers' parameters (as returned by initial_walkers(),
+    optionally followed by the jitters and the astrometric jitter): with fixed parameters, these are set to their values
+    (and, with a fixed Tp, phi_p = 2 pi Tp/P). marginalize: as in initial_walkers() (the result then holds the
+    parameters of fit_result['theta'] without its linear ones). Without fixed parameters, theta_free is returned unchanged.
     '''
     theta_free = np.asarray(theta_free, dtype=np.float64)
     free = fit_result.get('free_indices')
     if free is None:
         return theta_free
+    keep = np.where(~_linear_mask(fit_result))[0] if marginalize else np.arange(len(fit_result['theta']))
     theta = np.array(fit_result['theta'], dtype=np.float64)
-    theta[free] = theta_free[:len(free)]
+    sampled = _sampled_indices(fit_result, marginalize)
+    theta[sampled] = theta_free[:len(sampled)]
     names = list(fit_result['theta_names'])
     for key, Tp in fit_result['fixed'].items():
         name, _, i = key.rpartition('_')
         if name == 'Tp':
             P = theta[names.index('period_' + i)]
             theta[names.index('phi_p_' + i)] = 2*np.pi*np.mod(float(Tp)/P, 1)
-    return np.concatenate([theta, theta_free[len(free):]])
+    return np.concatenate([theta[keep], theta_free[len(sampled):]])
+
+def expand_marginal_samples(samples, fit_result, ast_data=None, rv_data=None, rv_dataset=None, jitter=None, fit_ast_jitter=False,
+                            reject_outlier=False, rv_only=None, rng=None, c_funcs=None, c_funcs_plus=None):
+    '''
+    Samples of all parameters, from samples of the likelihood functions' parameters with marginalize=True (after
+    full_theta() if the fit had fixed parameters): for each sample, the linear parameters (see the marginalize option
+    of the likelihood functions) are drawn from their conditional posterior, which is Gaussian. Returns an array with
+    one row per sample, ordered as fit_result['theta'], followed by the jitters and the astrometric jitter of the input.
+    fit_result: the fit whose theta defines the parameters (from fit_astrometry_planets(), fit_rv_planets() or
+        fit_astrometry_and_rv_planets()). ast_data = (t_ast_yr, psi, plx_factor, ast_obs, ast_err) and/or
+        rv_data = (t_rvs_yr, rv, rv_err), with rv_dataset, jitter, fit_ast_jitter, reject_outlier and rv_only (default:
+        fit_result['rv_only']) as given to the likelihood function.
+    '''
+    rng = _get_rng(rng)
+    samples = np.atleast_2d(np.asarray(samples, dtype=np.float64))
+    names = list(fit_result['theta_names'])
+    n_pl = fit_result['n_planets']
+    if ast_data is not None and rv_data is not None:
+        kind = 'joint'
+    elif ast_data is not None:
+        kind = 'astrometry'
+    elif rv_data is not None:
+        kind = 'rv'
+    else:
+        raise ValueError('give ast_data and/or rv_data.')
+    if kind == 'joint' and rv_only is None:
+        rv_only = fit_result.get('rv_only')
+    if rv_data is not None:
+        t_rv, rv, rv_err, sets, n_sets = _rv_data(*rv_data, rv_dataset)
+    out = []
+    for x in samples:
+        s = x[-1] if fit_ast_jitter else None
+        y = x[:-1] if fit_ast_jitter else x
+        if kind == 'astrometry':
+            core, extra = y[:3*n_pl], y[3*n_pl:]
+            err = np.asarray(ast_data[4], dtype=np.float64)
+            sig = err if s is None else np.sqrt(err**2 + s**2)
+            prob = _Problem(ast=(*ast_data[:4], sig), reject_outlier=reject_outlier, P_min=1e-10, P_max=np.inf, c_funcs_plus=c_funcs_plus)
+            _, mu, cov, _, _ = prob.marginal(core[0::3], core[2::3], core[1::3], want_cov=True)
+            lin = rng.multivariate_normal(mu, cov)
+            theta = [lin[0], lin[2], lin[4], lin[1], lin[3]]
+            for i in range(n_pl):
+                B, G, A, F = lin[5 + 4*i: 9 + 4*i]
+                theta += [*core[3*i: 3*i + 3], A, B, F, G]
+        elif kind == 'rv':
+            core, jit = (y[:3*n_pl], y[3*n_pl:]) if jitter is None else (y, np.broadcast_to(np.asarray(jitter, dtype=np.float64), (n_sets,)))
+            extra = y[3*n_pl:]
+            prob = _Problem(rv=(t_rv, rv, rv_err, sets), P_min=1e-10, P_max=np.inf, c_funcs_plus=c_funcs_plus)
+            prob.set_jitter(jit)
+            _, _, _, mu, cov = prob.marginal(core[0::3], core[2::3], core[1::3], want_cov=True)
+            lin = rng.multivariate_normal(mu, cov)
+            theta = list(lin[:n_sets])
+            for i in range(n_pl):
+                theta += [*core[3*i: 3*i + 3], *lin[n_sets + 2*i: n_sets + 2*i + 2]]
+        else:
+            core, extra = y[:1 + 7*n_pl], y[1 + 7*n_pl:]
+            jit = extra if jitter is None else np.broadcast_to(np.asarray(jitter, dtype=np.float64), (n_sets,))
+            prob = _Problem(ast=ast_data, rv=(t_rv, rv, rv_err, sets), c_funcs_plus=c_funcs_plus)
+            prob.set_jitter(jit)
+            flags = [i in set(rv_only or ()) for i in range(n_pl)]
+            model = _JointModel(prob, _get_c_funcs(c_funcs), np.ones(prob.n, dtype=bool), rv_only=flags)
+            phys = np.concatenate([[0.0, 0.0, core[0], 0.0, 0.0], core[1:]])
+            _, (ra_off, dec_off, pmra, pmdec), gamma = _joint_marginal(prob, model, phys, s, reject_outlier, rng=rng)
+            theta = [ra_off, dec_off, core[0], pmra, pmdec, *core[1:], *gamma]
+        out.append(np.concatenate([theta, extra, [] if s is None else [s]]))
+    return np.array(out)

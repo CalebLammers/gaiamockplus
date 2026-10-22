@@ -313,6 +313,101 @@ static double gmp_linear_solve(const gmp_data *d, int p, const double *A, double
     return chi2;
 }
 
+/* Cholesky factorization Nm = L L^T of a p x p symmetric positive definite matrix (row-major; L lower triangular).
+Returns 0 on success, 1 if the matrix is not numerically positive definite. */
+static int gmp_cholesky(int p, const double *Nm, double *L){
+    for (int i = 0; i < p; i++){
+        for (int k = 0; k <= i; k++){
+            double s = Nm[i*p + k];
+            for (int m = 0; m < k; m++) s -= L[i*p + m]*L[k*p + m];
+            if (i == k){
+                if (!(s > 1e-13*Nm[i*p + i]) || !isfinite(s)) return 1;
+                L[i*p + i] = sqrt(s);
+            } else {
+                L[i*p + k] = s/L[k*p + k];
+            }
+        }
+    }
+    return 0;
+}
+
+/* Solve L L^T x = b, with L from gmp_cholesky() */
+static void gmp_cholesky_solve(int p, const double *L, const double *b, double *x){
+    double y[GMP_MAX_LIN];
+    for (int i = 0; i < p; i++){
+        double s = b[i];
+        for (int m = 0; m < i; m++) s -= L[i*p + m]*y[m];
+        y[i] = s/L[i*p + i];
+    }
+    for (int i = p - 1; i >= 0; i--){
+        double s = y[i];
+        for (int m = i + 1; m < p; m++) s -= L[m*p + i]*x[m];
+        x[i] = s/L[i*p + i];
+    }
+}
+
+/* Weighted least squares as gmp_linear_solve() (with the same rejection of the worst epoch), also returning ln det of
+the normal matrix (for the marginal likelihood) and, if cov is not NULL, its inverse (the covariance of the linear
+parameters, p x p, row-major). Returns the chi2 at the solution, or INFINITY if the normal matrix is not positive definite. */
+static double gmp_linear_solve_cov(const gmp_data *d, int p, const double *A, double *mu, double *logdet, double *cov, int *worst){
+    int n = d->n;
+    double Nm[GMP_MAX_LIN*GMP_MAX_LIN], b[GMP_MAX_LIN], L[GMP_MAX_LIN*GMP_MAX_LIN];
+    *worst = -1;
+    for (int a = 0; a < p; a++){
+        double s = 0.0;
+        for (int j = 0; j < n; j++) s += d->w[j]*A[a*n + j]*d->obs[j];
+        b[a] = s;
+        for (int c = 0; c <= a; c++){
+            double s2 = 0.0;
+            for (int j = 0; j < n; j++) s2 += d->w[j]*A[a*n + j]*A[c*n + j];
+            Nm[a*p + c] = s2;
+            Nm[c*p + a] = s2;
+        }
+    }
+    if (d->plx_sig > 0){
+        Nm[4*p + 4] += 1.0/(d->plx_sig*d->plx_sig);
+        b[4] += d->plx_mu/(d->plx_sig*d->plx_sig);
+    }
+    if (gmp_cholesky(p, Nm, L)) return INFINITY;
+    gmp_cholesky_solve(p, L, b, mu);
+    if (d->reject && n > p + 1){
+        /* the epoch with the largest weighted residual of the full solution is dropped, as in gmp_linear_solve() */
+        double worst_chi2 = -1.0;
+        int jw = -1;
+        for (int j = 0; j < n; j++){
+            double pred = 0.0;
+            for (int a = 0; a < p; a++) pred += A[a*n + j]*mu[a];
+            double c2 = d->w[j]*(d->obs[j] - pred)*(d->obs[j] - pred);
+            if (c2 > worst_chi2) { worst_chi2 = c2; jw = j; }
+        }
+        for (int a = 0; a < p; a++){
+            b[a] -= d->w[jw]*A[a*n + jw]*d->obs[jw];
+            for (int c = 0; c < p; c++) Nm[a*p + c] -= d->w[jw]*A[a*n + jw]*A[c*n + jw];
+        }
+        if (gmp_cholesky(p, Nm, L)) return INFINITY;
+        gmp_cholesky_solve(p, L, b, mu);
+        *worst = jw;
+    }
+    double chi2 = 0.0;
+    for (int j = 0; j < n; j++){
+        if (j == *worst) continue;
+        double pred = 0.0;
+        for (int a = 0; a < p; a++) pred += A[a*n + j]*mu[a];
+        chi2 += d->w[j]*(d->obs[j] - pred)*(d->obs[j] - pred);
+    }
+    *logdet = 0.0;
+    for (int i = 0; i < p; i++) *logdet += 2*log(L[i*p + i]);
+    if (cov != NULL){
+        double unit[GMP_MAX_LIN], col[GMP_MAX_LIN];
+        for (int c = 0; c < p; c++){
+            for (int i = 0; i < p; i++) unit[i] = (i == c) ? 1.0 : 0.0;
+            gmp_cholesky_solve(p, L, unit, col);
+            for (int i = 0; i < p; i++) cov[i*p + c] = col[i];
+        }
+    }
+    return chi2;
+}
+
 /* ---------------------------------------------------------------- the fitting problem: astrometry and/or RVs */
 
 /* A problem is an astrometric dataset, an RV dataset, or both. For fixed nonlinear parameters (P, phi, e) of each
@@ -422,6 +517,33 @@ void gmp_chi2(GMP_DATA_ARGS, int n_pl, const double *P, const double *phi, const
     int worst;
     gmp_problem_solve(&pr, n_pl, out, &worst, mu_ast, mu_rv);
     out[3] = worst;
+    gmp_problem_free(&pr);
+}
+
+/* ---------------------------------------------------------------- exported: marginal likelihood terms */
+
+/* For fixed nonlinear parameters, the terms of the likelihood marginalized over the linear parameters of each dataset
+(with flat priors): out[0] = astrometric chi2 at the best linear parameters, out[1] = ln det of the astrometric normal
+matrix, out[2] = index of the rejected astrometric epoch (-1 if none), out[3] = RV chi2, out[4] = ln det of the RV
+normal matrix (NAN for a dataset that is not given, or INFINITY for the chi2 if a normal matrix is singular).
+mu_ast (5 + 4 n_pl) and mu_rv (n_sets + 2 n_pl) receive the best linear parameters, in the order of gmp_chi2() (planets
+skipped with ast_skip have no astrometric entries); if want_cov, cov_ast and cov_rv receive their covariance matrices
+(row-major). Unused outputs are left untouched (pass any array). */
+void gmp_marginal(GMP_DATA_ARGS, int n_pl, const double *P, const double *phi, const double *e, int want_cov,
+                  double *out, double *mu_ast, double *cov_ast, double *mu_rv, double *cov_rv){
+    out[0] = out[3] = INFINITY; out[1] = out[4] = NAN; out[2] = -1;
+    gmp_problem pr;
+    if (gmp_problem_init(&pr, GMP_DATA_PASS, n_pl)) return;
+    for (int i = 0; i < n_pl; i++) gmp_problem_fill_planet(&pr, i, P[i], phi[i], e[i]);
+    for (int k = 0; k < pr.nd; k++){
+        gmp_data *d = &pr.d[k];
+        int p = gmp_col(d, n_pl), worst;
+        double logdet = NAN;
+        int ast = d->type == GMP_AST;
+        double chi2 = gmp_linear_solve_cov(d, p, pr.A[k], ast ? mu_ast : mu_rv, &logdet, want_cov ? (ast ? cov_ast : cov_rv) : NULL, &worst);
+        if (ast) { out[0] = chi2; out[1] = logdet; out[2] = worst; }
+        else { out[3] = chi2; out[4] = logdet; }
+    }
     gmp_problem_free(&pr);
 }
 
